@@ -3,7 +3,7 @@ use regex::Regex;
 use anyhow::{Context, Result};
 
 
-const EXAMPLE: &str = "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-04.zip";
+// const EXAMPLE: &str = "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-04.zip";
 
 const BINANCE_BASE_URL: &str = "https://data.binance.vision/";
 
@@ -36,18 +36,24 @@ pub struct FileInfo {
 }
 impl FileInfo {
     pub fn remote_url(&self) -> String {
-        format!("{}/data/spot/monthly/klines/{}/1m/{}", BINANCE_BASE_URL, self.symbol, self.filename)
+        format!("{}data/spot/monthly/klines/{}/1m/{}", BINANCE_BASE_URL, self.symbol, self.filename)
     }
     pub fn local_path(&self) -> String {
         format!("{}/data/spot/monthly/klines/{}/1m/{}", *ARCHIVE_BASE_PATH, self.symbol, self.filename)
     }
 }
 impl FileInfo {
-    pub async fn remote_url_exists(url: &str) -> Result<bool> {
-        http_client::remote_url_exists(url).await
+    pub async fn remote_url_exists(&self) -> Result<bool> {
+        http_client::remote_url_exists(self).await
+    }
+    pub fn local_path_exists(&self) -> Result<bool> {
+        http_client::local_path_exists(self)
+    }
+    pub async fn download(&self) -> Result<bool> {
+        http_client::download(self).await
     }
     pub fn create_local_file_for_writing(&self) -> Result<std::fs::File> {
-        paths::create_dir_from_file_info(self)?;
+        fs::create_dir_from_file_info(self)?;
         std::fs::File::create(self.local_path()).with_context(|| { "Can't open file" })
     }
 }
@@ -57,7 +63,7 @@ impl From<&str> for FileInfo {
     }
 }
 
-mod paths {
+mod fs {
     pub fn create_dir_from_file_info(file_info: &super::FileInfo) -> std::io::Result<()> {
         let dir_path = std::path::PathBuf::from(&file_info.local_path())
             .parent().unwrap()
@@ -70,27 +76,30 @@ mod paths {
 mod http_client {
     use anyhow::Result;
 
-    use async_curl::CurlActor;
-    use curl_http_client::*;
-    use http::{Method, Request};
+    pub async fn remote_url_exists(file_info: &super::FileInfo) -> Result<bool> {
+        println!("🚧 Testing Download:                 {}", file_info.remote_url());
+        let response = reqwest::get(&file_info.remote_url()).await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        let local_file = file_info.create_local_file_for_writing()?;
+        let mut local_file = tokio::fs::File::from_std(local_file);
+        tokio::io::copy(&mut bytes.as_ref(), &mut local_file).await?;
 
-    pub async fn remote_url_exists(url: &str) -> Result<bool> {
-        let actor = CurlActor::new();
-        let collector = Collector::Ram(Vec::new());
+        Ok(status.is_success())
+    }
+    pub fn local_path_exists(file_info: &super::FileInfo) -> Result<bool> {
+        Ok(std::path::PathBuf::from(&file_info.local_path()).exists())
+    }
+    pub async fn download(file_info: &super::FileInfo) -> Result<bool> {
+        println!("✅️ Downloading:                      {}", file_info.remote_url());
+        let response = reqwest::get(&file_info.remote_url()).await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        let local_file = file_info.create_local_file_for_writing()?;
+        let mut local_file = tokio::fs::File::from_std(local_file);
+        tokio::io::copy(&mut bytes.as_ref(), &mut local_file).await?;
 
-        let request = Request::builder()
-            .uri(url)
-            .method(Method::HEAD)
-            .body(None)
-            .unwrap();
-
-        let response = HttpClient::new(collector)
-            .request(request).unwrap()
-            .nonblocking(actor)
-            .perform()
-            .await.unwrap();
-
-        Ok(response.status().is_success())
+        Ok(status.is_success())
     }
 
     pub fn parse_url(url: &str) -> Option<super::FileInfo> {

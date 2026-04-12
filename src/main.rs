@@ -1,14 +1,10 @@
 
 pub(crate) mod paths;
 
-
-
-use std::fs::read_to_string;
-
 use anyhow::Result;
 use crossbeam::channel::bounded;
 use tokio::fs::File;
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader, AsyncRead};
 
 
 const PIPE_SIZE: usize = 10;
@@ -17,55 +13,72 @@ const PIPE_SIZE: usize = 10;
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    let file = File::open("./data/data.txt")
-        .await?;
-
-    let mut file_reader = BufReader::new(file);
-
-    let (mut url_reader, mut url_writer) = bounded(PIPE_SIZE);
-
-    let file_handler = tokio::spawn(async move {
-        let mut line = String::new();
-        while file_reader.read_line(&mut line).await? > 0 {
-            url_writer.send(line.clone()).unwrap();
-            line.clear();
-        }
+    let filename = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("Usage: binance-downloader <path_to_file_with_urls>, e.g. ./data/data.txt. '-' for <stdio>.");
+        std::process::exit(1);
     });
+    let (url_writer, url_reader) = bounded(PIPE_SIZE);
 
-    let (mut not_remote_reader, mut not_remote_writer) = bounded(PIPE_SIZE);
-    let (mut download_reader, mut download_writer) = bounded(PIPE_SIZE);
+    let file_handler = {
+        let filename = filename.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let file_reader: BufReader<Box<dyn AsyncRead + Unpin>> = if filename == "-" {
+                    BufReader::new(Box::new(tokio::io::stdin()))
+                } else {
+                    BufReader::new(Box::new(File::open(filename).await?))
+                };
+                let mut file_reader = file_reader;
+                let mut line = String::new();
+                while file_reader.read_line(&mut line).await? > 0 {
+                    url_writer.send(line.clone())?;
+                    line.clear();
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+        })
+    };
+
+    let (not_remote_writer, not_remote_reader) = bounded(PIPE_SIZE);
+    let (download_writer, download_reader) = bounded(PIPE_SIZE);
 
     let url_handler = tokio::spawn(async move {
-        while let Ok(url) = url_reader.recv() {
+        for url in url_reader.iter() {
             let file_info = paths::FileInfo::from(url.as_str());
-            if file_info.remote_url_exists(&file_info.remote_url()).await.unwrap_or(false) {
-                download_writer.send(file_info).unwrap();
+            if file_info.local_path_exists().unwrap_or(false) {
+                println!("🤟 File already exists locally:      {}", file_info.local_path());
+                continue;
+            }
+            if file_info.remote_url_exists().await.unwrap_or(false) {
+                download_writer.send(file_info)?;
             } else {
-                not_remote_writer.send(file_info).unwrap();
+                not_remote_writer.send(file_info)?;
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     let not_remote_handler = tokio::spawn(async move {
-        while let Ok(file_info) = not_remote_reader.recv() {
-            println!("Remote URL does not exist: {}", file_info.remote_url());
+        for file_info in not_remote_reader.iter() {
+            println!("❌ Remote URL does not exist:        {}", file_info.remote_url());
         }
+        Ok::<(), anyhow::Error>(())
     });
 
-    let download_handler = tokio::spawn(async move {
-        while let Ok(file_info) = download_reader.recv() {
-            println!("Downloading: {}", file_info.remote_url());
-            let response = reqwest::get(&file_info.remote_url()).await?;
-            let bytes = response.bytes().await?;
-            let mut local_file = file_info.create_local_file_for_writing()?;
-            tokio::io::copy(&mut bytes.as_ref(), &mut local_file).await?;
-        }
-    });
+    let download_handler = {
+        tokio::spawn(async move {
+            for file_info in download_reader.iter() {
+                file_info.download().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    };
 
-    url_handler.await?;
-    not_remote_handler.await?;
-    download_handler.await?;
-    file_handler.await?;
+    let _ = url_handler.await?;
+    let _ = not_remote_handler.await?;
+    let _ = download_handler.await?;
+    let _ = file_handler.await?;
 
     Ok(())
 }
