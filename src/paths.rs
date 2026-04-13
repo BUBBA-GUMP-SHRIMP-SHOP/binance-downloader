@@ -1,7 +1,6 @@
-use std::{env, path::PathBuf};
-use regex::Regex;
 use anyhow::{Context, Result};
-
+use regex::Regex;
+use std::{env, path::PathBuf};
 
 // const EXAMPLE: &str = "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-04.zip";
 
@@ -36,10 +35,16 @@ pub struct FileInfo {
 }
 impl FileInfo {
     pub fn remote_url(&self) -> String {
-        format!("{}data/spot/monthly/klines/{}/1m/{}", BINANCE_BASE_URL, self.symbol, self.filename)
+        format!(
+            "{}data/spot/monthly/klines/{}/1m/{}",
+            BINANCE_BASE_URL, self.symbol, self.filename
+        )
     }
     pub fn local_path(&self) -> String {
-        format!("{}/data/spot/monthly/klines/{}/1m/{}", *ARCHIVE_BASE_PATH, self.symbol, self.filename)
+        format!(
+            "{}/data/spot/monthly/klines/{}/1m/{}",
+            *ARCHIVE_BASE_PATH, self.symbol, self.filename
+        )
     }
 }
 impl FileInfo {
@@ -54,7 +59,7 @@ impl FileInfo {
     }
     pub fn create_local_file_for_writing(&self) -> Result<std::fs::File> {
         fs::create_dir_from_file_info(self)?;
-        std::fs::File::create(self.local_path()).with_context(|| { "Can't open file" })
+        std::fs::File::create(self.local_path()).with_context(|| "Can't open file")
     }
 }
 impl From<&str> for FileInfo {
@@ -66,9 +71,9 @@ impl From<&str> for FileInfo {
 mod fs {
     pub fn create_dir_from_file_info(file_info: &super::FileInfo) -> std::io::Result<()> {
         let dir_path = std::path::PathBuf::from(&file_info.local_path())
-            .parent().unwrap()
-            .to_path_buf()
-            ;
+            .parent()
+            .unwrap()
+            .to_path_buf();
         std::fs::create_dir_all(dir_path)
     }
 }
@@ -77,7 +82,10 @@ mod http_client {
     use anyhow::Result;
 
     pub async fn remote_url_exists(file_info: &super::FileInfo) -> Result<bool> {
-        println!("🚧 Testing Download:                 {}", file_info.remote_url());
+        println!(
+            "🚧 Testing Download:                 {}",
+            file_info.remote_url()
+        );
         let response = reqwest::get(&file_info.remote_url()).await?;
         let status = response.status();
         let bytes = response.bytes().await?;
@@ -91,7 +99,10 @@ mod http_client {
         Ok(std::path::PathBuf::from(&file_info.local_path()).exists())
     }
     pub async fn download(file_info: &super::FileInfo) -> Result<bool> {
-        println!("✅️ Downloading:                      {}", file_info.remote_url());
+        println!(
+            "✅️ Downloading:                      {}",
+            file_info.remote_url()
+        );
         let response = reqwest::get(&file_info.remote_url()).await?;
         let status = response.status();
         let bytes = response.bytes().await?;
@@ -108,7 +119,62 @@ mod http_client {
         let year = captures.get(3)?.as_str().to_string();
         let month = captures.get(4)?.as_str().to_string();
         let filename = format!("{}-1m-{}-{}.zip", symbol, year, month);
-        Some(super::FileInfo { symbol, month, year, filename })
+        Some(super::FileInfo {
+            symbol,
+            month,
+            year,
+            filename,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{http_client, FileInfo};
+
+    #[test]
+    fn parse_url_extracts_fields() {
+        let url = "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-04.zip";
+        let parsed = http_client::parse_url(url).expect("URL should match Binance kline pattern");
+
+        assert_eq!(parsed.symbol, "BTCUSDT");
+        assert_eq!(parsed.year, "2026");
+        assert_eq!(parsed.month, "04");
+        assert_eq!(parsed.filename, "BTCUSDT-1m-2026-04.zip");
     }
 
+    #[test]
+    fn parse_url_rejects_unexpected_url() {
+        let invalid = "https://example.com/not-binance.zip";
+        assert!(http_client::parse_url(invalid).is_none());
+    }
+
+    #[test]
+    fn remote_url_is_built_from_file_info() {
+        let file_info = FileInfo {
+            symbol: "ETHUSDT".to_string(),
+            month: "01".to_string(),
+            year: "2025".to_string(),
+            filename: "ETHUSDT-1m-2025-01.zip".to_string(),
+        };
+
+        assert_eq!(
+            file_info.remote_url(),
+            "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1m/ETHUSDT-1m-2025-01.zip"
+        );
+    }
+
+    #[test]
+    fn local_path_contains_expected_suffix() {
+        let file_info = FileInfo {
+            symbol: "SOLUSDT".to_string(),
+            month: "12".to_string(),
+            year: "2024".to_string(),
+            filename: "SOLUSDT-1m-2024-12.zip".to_string(),
+        };
+
+        assert!(file_info
+            .local_path()
+            .ends_with("/data/spot/monthly/klines/SOLUSDT/1m/SOLUSDT-1m-2024-12.zip"));
+    }
 }
