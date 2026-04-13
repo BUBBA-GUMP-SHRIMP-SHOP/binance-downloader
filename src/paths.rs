@@ -80,6 +80,7 @@ mod fs {
 
 mod http_client {
     use anyhow::Result;
+    use tokio::time;
 
     pub async fn remote_url_exists(file_info: &super::FileInfo) -> Result<bool> {
         println!(
@@ -92,6 +93,8 @@ mod http_client {
         let local_file = file_info.create_local_file_for_writing()?;
         let mut local_file = tokio::fs::File::from_std(local_file);
         tokio::io::copy(&mut bytes.as_ref(), &mut local_file).await?;
+
+        tokio::time::sleep(time::Duration::from_secs(1)).await;
 
         Ok(status.is_success())
     }
@@ -109,6 +112,8 @@ mod http_client {
         let local_file = file_info.create_local_file_for_writing()?;
         let mut local_file = tokio::fs::File::from_std(local_file);
         tokio::io::copy(&mut bytes.as_ref(), &mut local_file).await?;
+
+        tokio::time::sleep(time::Duration::from_secs(1)).await;
 
         Ok(status.is_success())
     }

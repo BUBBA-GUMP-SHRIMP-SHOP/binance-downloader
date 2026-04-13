@@ -6,9 +6,10 @@ use anyhow::Result;
 use crossbeam::channel::{bounded, Receiver};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncRead};
+use std::future::Future;
 
 
-const PIPE_SIZE: usize = 10;
+const PIPE_SIZE: usize = 20;
 
 // ============================================================================
 // PROCESSING UNIT: URL Parser
@@ -84,24 +85,56 @@ async fn stage_file_reader(filename: String, url_tx: crossbeam::channel::Sender<
 }
 
 // ============================================================================
-// EXISTENCE & ROUTING STAGE
-// Parses URLs to FileInfo, checks existence, routes to appropriate handler
+// PARALLEL RUNNER (shared helper)
+// Drains `rx`, spawning one task per item via `make_task`.
+// At most `parallelism` tasks run concurrently; back-pressure is applied by
+// awaiting the oldest task before spawning a new one when at capacity.
 // ============================================================================
-async fn stage_existence_and_route(
-    url_rx: Receiver<String>,
-    download_tx: crossbeam::channel::Sender<paths::FileInfo>,
-    not_remote_tx: crossbeam::channel::Sender<paths::FileInfo>,
-) -> Result<()> {
-    for url in url_rx.iter() {
-        let file_info = pu_url_parser(&url);
-        pu_existence_checker(&file_info, download_tx.clone(), not_remote_tx.clone()).await?;
+async fn run_parallel<T, F, Fut>(rx: Receiver<T>, parallelism: usize, make_task: F) -> Result<()>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let mut join_set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+
+    for item in rx.iter() {
+        if join_set.len() >= parallelism {
+            if let Some(result) = join_set.join_next().await {
+                result??;
+            }
+        }
+        join_set.spawn(make_task(item));
     }
+
+    while let Some(result) = join_set.join_next().await {
+        result??;
+    }
+
     Ok(())
 }
 
 // ============================================================================
+// EXISTENCE & ROUTING STAGE
+// ============================================================================
+async fn stage_parallel_existence_and_route(
+    url_rx: Receiver<String>,
+    download_tx: crossbeam::channel::Sender<paths::FileInfo>,
+    not_remote_tx: crossbeam::channel::Sender<paths::FileInfo>,
+    parallelism: usize,
+) -> Result<()> {
+    run_parallel(url_rx, parallelism, move |url| {
+        let dl = download_tx.clone();
+        let nr = not_remote_tx.clone();
+        async move {
+            let file_info = pu_url_parser(&url);
+            pu_existence_checker(&file_info, dl, nr).await
+        }
+    }).await
+}
+
+// ============================================================================
 // NOT-FOUND LOGGING STAGE
-// Logs file entries that don't exist remotely
 // ============================================================================
 async fn stage_not_found_logging(not_remote_rx: Receiver<paths::FileInfo>) -> Result<()> {
     for file_info in not_remote_rx.iter() {
@@ -112,13 +145,14 @@ async fn stage_not_found_logging(not_remote_rx: Receiver<paths::FileInfo>) -> Re
 
 // ============================================================================
 // DOWNLOAD STAGE
-// Downloads files from remote URL to local path
 // ============================================================================
-async fn stage_downloader(download_rx: Receiver<paths::FileInfo>) -> Result<()> {
-    for file_info in download_rx.iter() {
-        pu_downloader(&file_info).await?;
-    }
-    Ok(())
+async fn stage_parallel_downloader(
+    download_rx: Receiver<paths::FileInfo>,
+    parallelism: usize,
+) -> Result<()> {
+    run_parallel(download_rx, parallelism, |file_info| async move {
+        pu_downloader(&file_info).await
+    }).await
 }
 
 #[tokio::main]
@@ -143,18 +177,19 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Spawn existence & routing stage
-    let existence_router_handle = tokio::spawn(stage_existence_and_route(
+    // Spawn parallel existence & routing stage — up to PIPE_SIZE concurrent checks
+    let existence_router_handle = tokio::spawn(stage_parallel_existence_and_route(
         url_rx,
         download_tx,
         not_remote_tx,
+        PIPE_SIZE,
     ));
 
     // Spawn not-found logging stage
     let not_found_logger_handle = tokio::spawn(stage_not_found_logging(not_remote_rx));
 
-    // Spawn download stage
-    let downloader_handle = tokio::spawn(stage_downloader(download_rx));
+    // Spawn parallel download stage — up to PIPE_SIZE concurrent downloads
+    let downloader_handle = tokio::spawn(stage_parallel_downloader(download_rx, PIPE_SIZE));
 
     // Wait for all stages to complete
     let _ = file_reader_handle.await?;
