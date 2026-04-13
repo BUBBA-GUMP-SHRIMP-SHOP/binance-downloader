@@ -1,198 +1,124 @@
 
+#![allow(dead_code)]
+
 pub(crate) mod processor;
-pub(crate) mod paths;
+pub(crate) mod processor_unit;
+pub(crate) mod stages;
+pub(crate) mod scraper;
+pub(crate) mod file_info;
+pub(crate) mod pipeline;
 
-use anyhow::Result;
-use crossbeam::channel::{bounded, Receiver};
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, BufReader, AsyncRead};
-use std::future::Future;
+use std::fs::File;
+use std::io::{BufRead, BufReader, stdin};
 
+use crossbeam::channel::bounded;
+
+use crate::file_info::FileInfo;
+use crate::pipeline::{Event, Pipeline};
+use crate::scraper::{extract_pairs, extract_zip_files};
 
 const PIPE_SIZE: usize = 20;
 
-// ============================================================================
-// PROCESSING UNIT: URL Parser
-// Converts raw URL strings into FileInfo structures
-// ============================================================================
-fn pu_url_parser(url: &String) -> paths::FileInfo {
-    paths::FileInfo::from(url.as_str())
-}
 
-// ============================================================================
-// PROCESSING UNIT: Existence Checker
-// Checks local/remote existence and routes via side effects
-// Routes: locally existing -> log only
-//         remote exists -> download channel
-//         remote missing -> not-remote channel
-// ============================================================================
-async fn pu_existence_checker(
-    file_info: &paths::FileInfo,
-    download_tx: crossbeam::channel::Sender<paths::FileInfo>,
-    not_remote_tx: crossbeam::channel::Sender<paths::FileInfo>,
-) -> Result<()> {
-    if file_info.local_path_exists().unwrap_or(false) {
-        println!("🤟 File already exists locally:      {}", file_info.local_path());
-        return Ok(());
-    }
-
-    if file_info.remote_url_exists().await.unwrap_or(false) {
-        download_tx.send(file_info.clone())?;
+pub fn buffered_reader(filename: String) -> anyhow::Result<Box<dyn BufRead + Send>> {
+    let reader: Box<dyn BufRead + Send> = if filename == "-" {
+        Box::new(BufReader::new(stdin()))
     } else {
-        not_remote_tx.send(file_info.clone())?;
-    }
-
-    Ok(())
+        Box::new(BufReader::new(File::open(filename)?))
+    };
+    Ok(reader)
 }
 
-// ============================================================================
-// PROCESSING UNIT: Not Found Logger
-// Logs FileInfo entries where remote URL was not found
-// ============================================================================
-fn pu_not_found_logger(file_info: &paths::FileInfo) -> () {
-    println!("❌ Remote URL does not exist:        {}", file_info.remote_url());
-}
+        #[tokio::main]
+async fn main() -> anyhow::Result<()> {
 
-// ============================================================================
-// PROCESSING UNIT: Downloader
-// Downloads files from remote URL to local path
-// ============================================================================
-async fn pu_downloader(file_info: &paths::FileInfo) -> Result<()> {
-    file_info.download().await?;
-    Ok(())
-}
-
-// ============================================================================
-// FILE READER STAGE
-// Reads URLs from file or stdin and feeds into pipeline
-// ============================================================================
-async fn stage_file_reader(filename: String, url_tx: crossbeam::channel::Sender<String>) -> Result<()> {
-    let file_reader: BufReader<Box<dyn AsyncRead + Unpin>> = if filename == "-" {
-        BufReader::new(Box::new(tokio::io::stdin()))
-    } else {
-        BufReader::new(Box::new(File::open(filename).await?))
+    let pipeline = Pipeline {
+        url: bounded(PIPE_SIZE).into(),
+        download: bounded(PIPE_SIZE).into(),
+        not_remote: bounded(PIPE_SIZE).into(),
     };
 
-    let mut file_reader = file_reader;
-    let mut line = String::new();
+    let handler = if let Some(filename) = std::env::args().nth(1)  {
+        let reader = buffered_reader(filename)?;
+        let pipeline_clone = pipeline.clone();
 
-    while file_reader.read_line(&mut line).await? > 0 {
-        url_tx.send(line.clone())?;
-        line.clear();
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// PARALLEL RUNNER (shared helper)
-// Drains `rx`, spawning one task per item via `make_task`.
-// At most `parallelism` tasks run concurrently; back-pressure is applied by
-// awaiting the oldest task before spawning a new one when at capacity.
-// ============================================================================
-async fn run_parallel<T, F, Fut>(rx: Receiver<T>, parallelism: usize, make_task: F) -> Result<()>
-where
-    T: Send + 'static,
-    F: Fn(T) -> Fut,
-    Fut: Future<Output = Result<()>> + Send + 'static,
-{
-    let mut join_set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
-
-    for item in rx.iter() {
-        if join_set.len() >= parallelism {
-            if let Some(result) = join_set.join_next().await {
-                result??;
-            }
-        }
-        join_set.spawn(make_task(item));
-    }
-
-    while let Some(result) = join_set.join_next().await {
-        result??;
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// EXISTENCE & ROUTING STAGE
-// ============================================================================
-async fn stage_parallel_existence_and_route(
-    url_rx: Receiver<String>,
-    download_tx: crossbeam::channel::Sender<paths::FileInfo>,
-    not_remote_tx: crossbeam::channel::Sender<paths::FileInfo>,
-    parallelism: usize,
-) -> Result<()> {
-    run_parallel(url_rx, parallelism, move |url| {
-        let dl = download_tx.clone();
-        let nr = not_remote_tx.clone();
-        async move {
-            let file_info = pu_url_parser(&url);
-            pu_existence_checker(&file_info, dl, nr).await
-        }
-    }).await
-}
-
-// ============================================================================
-// NOT-FOUND LOGGING STAGE
-// ============================================================================
-async fn stage_not_found_logging(not_remote_rx: Receiver<paths::FileInfo>) -> Result<()> {
-    for file_info in not_remote_rx.iter() {
-        pu_not_found_logger(&file_info);
-    }
-    Ok(())
-}
-
-// ============================================================================
-// DOWNLOAD STAGE
-// ============================================================================
-async fn stage_parallel_downloader(
-    download_rx: Receiver<paths::FileInfo>,
-    parallelism: usize,
-) -> Result<()> {
-    run_parallel(download_rx, parallelism, |file_info| async move {
-        pu_downloader(&file_info).await
-    }).await
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-
-    let filename = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: binance-downloader <path_to_file_with_urls>, e.g. ./data/data.txt. '-' for <stdio>.");
-        std::process::exit(1);
-    });
-
-    // Create pipeline channels
-    let (url_tx, url_rx) = bounded(PIPE_SIZE);
-    let (download_tx, download_rx) = bounded(PIPE_SIZE);
-    let (not_remote_tx, not_remote_rx) = bounded(PIPE_SIZE);
-
-    // Spawn file reader stage
-    let file_reader_handle = {
-        let filename = filename.clone();
         tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(stage_file_reader(filename, url_tx))
+            for line in reader.lines() {
+                let line = line?;
+                        pipeline_clone.url.tx.send(Event::Data(line))?;
+            }
+            pipeline_clone.url.tx.send(Event::End)?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+    else {
+        let pipeline_clone = pipeline.clone();
+
+        tokio::task::spawn(async move {
+            let (_, content) = FileInfo::download_html("https://data.binance.vision/?prefix=data/spot/monthly/klines/").await?;
+            println!("{}", content.clone());
+            let pairs = extract_pairs(&content);
+            for pair in pairs.iter() {
+                let klines_url = format!(
+                    "https://data.binance.vision/data/spot/monthly/klines/{}/1m/",
+                    pair
+                );
+                let (_, klines_content) = FileInfo::download_html(&klines_url).await?;
+                let zip_files = extract_zip_files(&klines_content).0;
+                for zip_file in zip_files.iter() {
+                    // Do something with the pair and zip_files
+                    let filename = format!("https://data.binance.vision/data/spot/monthly/klines/{}/1m/{}", pair, zip_file);
+                    pipeline_clone.url.tx.send(Event::Data(filename))?;
+                }
+            }
+            pipeline_clone.url.tx.send(Event::End)?;
+            Ok::<(), anyhow::Error>(())
         })
     };
 
-    // Spawn parallel existence & routing stage — up to PIPE_SIZE concurrent checks
-    let existence_router_handle = tokio::spawn(stage_parallel_existence_and_route(
-        url_rx,
-        download_tx,
-        not_remote_tx,
-        PIPE_SIZE,
-    ));
+    // read from pipeline.url, check existence, route to download or not_remote
+    while let Ok(event) = pipeline.url.rx.recv() {
+        match event {
+            Event::Data(url) => {
+                let file_info = crate::processor_unit::url_parser(&url);
+                println!("Received URL: {}, parsed as: {:?}", url, file_info);
+             //   crate::processor_unit::existence_checker(&file_info, pipeline.download.tx.clone(), pipeline.not_remote.tx.clone()).await?;
+            }
+            Event::End => break,
+        }
+    }
+    println!("Finished reading URLs. Starting processing...");
 
-    // Spawn not-found logging stage
-    let not_found_logger_handle = tokio::spawn(stage_not_found_logging(not_remote_rx));
+    // perform_download(pipeline).await?;
+
+    let _ = handler.await?;
+
+    Ok(())
+}
+
+async fn perform_download(pipeline: Pipeline) -> anyhow::Result<()> {
+
+    // Spawn parallel existence & routing stage — up to PIPE_SIZE concurrent checks
+    let url_rx = pipeline.url.rx.clone();
+    let download_tx = pipeline.download.tx.clone();
+    let not_remote_tx = pipeline.not_remote.tx.clone();
+    let existence_router_handle = tokio::spawn(async move {
+        stages::parallel_existence_and_route(url_rx, download_tx, not_remote_tx, PIPE_SIZE).await
+    });
+
+    // Spawn notfound logging stage
+    let not_remote_rx = pipeline.not_remote.rx.clone();
+    let not_found_logger_handle = tokio::spawn(async move {
+        stages::not_found_logging(not_remote_rx).await
+    });
 
     // Spawn parallel download stage — up to PIPE_SIZE concurrent downloads
-    let downloader_handle = tokio::spawn(stage_parallel_downloader(download_rx, PIPE_SIZE));
+    let download_rx = pipeline.download.rx.clone();
+    let downloader_handle = tokio::spawn(async move {
+            stages::parallel_downloader(download_rx, PIPE_SIZE).await
+    });
 
     // Wait for all stages to complete
-    let _ = file_reader_handle.await?;
     let _ = existence_router_handle.await?;
     let _ = not_found_logger_handle.await?;
     let _ = downloader_handle.await?;

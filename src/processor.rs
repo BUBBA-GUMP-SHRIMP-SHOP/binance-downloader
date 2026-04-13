@@ -1,6 +1,52 @@
 use crossbeam::channel::Receiver;
 use parking_lot::RwLock;
 
+// ============================================================================
+// PARALLEL RUNNER (shared helper)
+// Drains `rx`, spawning one task per item via `make_task`.
+// At most `parallelism` tasks run concurrently; back-pressure is applied by
+// awaiting the oldest task before spawning a new one when at capacity.
+// ============================================================================
+pub async fn run_parallel<T, F, Fut>(
+    rx: Receiver<T>,
+    parallelism: usize,
+    make_task: F,
+) -> anyhow::Result<()>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    // Bridge the blocking crossbeam receiver to an async tokio channel so
+    // we never block the tokio executor inside an async task.
+    let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<T>(parallelism);
+    tokio::task::spawn_blocking(move || {
+        for item in rx {
+            if bridge_tx.blocking_send(item).is_err() {
+                break;
+            }
+        }
+        // bridge_tx dropped here → bridge_rx.recv() returns None
+    });
+
+    let mut join_set: tokio::task::JoinSet<anyhow::Result<()>> = tokio::task::JoinSet::new();
+
+    while let Some(item) = bridge_rx.recv().await {
+        if join_set.len() >= parallelism {
+            if let Some(result) = join_set.join_next().await {
+                result??;
+            }
+        }
+        join_set.spawn(make_task(item));
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        result??;
+    }
+
+    Ok(())
+}
+
 pub trait Processor<'a> {
     type In;
     type Out;
