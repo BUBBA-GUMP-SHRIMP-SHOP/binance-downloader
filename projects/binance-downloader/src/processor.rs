@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use std::future::Future;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt},
@@ -6,7 +6,8 @@ use tokio::{
 };
 
 /// Read incrementally and apply backpressure without blocking runtime threads.
-/// Item failures are reported by the worker; all other items still get a turn.
+/// Item failures are reported by the worker. A line containing `poison pill`
+/// ends input; previously started workers are drained normally.
 pub async fn run<R, F, Fut>(reader: R, parallelism: usize, mut worker: F) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -24,6 +25,9 @@ where
             let Some(line) = lines.next_line().await? else {
                 break;
             };
+            if line.contains("poison pill") {
+                break;
+            }
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -48,8 +52,8 @@ where
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
 
     // A single-thread runtime exposes the old blocking-channel deadlock.
@@ -81,5 +85,25 @@ mod tests {
     #[tokio::test]
     async fn rejects_zero_workers() {
         assert!(run(&b"one\n"[..], 0, |_| async {}).await.is_err());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn poison_pill_stops_input_and_finishes_started_workers() {
+        for marker in ["poison pill", "prefix poison pill suffix", "# poison pill"] {
+            let done = Arc::new(AtomicUsize::new(0));
+            let input = format!("first\nsecond\n{marker}\nmust not run\n");
+            let mut dispatched = Vec::new();
+            run(input.as_bytes(), 4, |line| {
+                dispatched.push(line);
+                let done = done.clone();
+                async move {
+                    tokio::task::yield_now().await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(dispatched, ["first", "second"]);
+            assert_eq!(done.load(Ordering::SeqCst), 2);
+        }
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -81,12 +81,9 @@ impl FileInfo {
         )
     }
 
-    pub fn local_path(&self) -> PathBuf {
-        let root = std::env::var_os("ARCHIVE_BASE_PATH")
-            .map(PathBuf::from)
-            .or_else(dirs::data_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        root.join("binance-archive/data/spot/monthly/klines")
+    pub fn local_path(&self, archive_root: &Path) -> PathBuf {
+        archive_root
+            .join("data/spot/monthly/klines")
             .join(&self.symbol)
             .join("1m")
             .join(&self.filename)
@@ -95,10 +92,26 @@ impl FileInfo {
     pub async fn download(
         &self,
         client: &reqwest::Client,
+        archive_root: &Path,
         progress: impl FnMut(u64, Option<u64>),
     ) -> Result<Outcome> {
-        download_to(client, &self.remote_url(), &self.local_path(), progress).await
+        download_to(
+            client,
+            &self.remote_url(),
+            &self.local_path(archive_root),
+            progress,
+        )
+        .await
     }
+}
+
+/// Preserve the existing environment/OS default when no CLI destination is given.
+pub fn default_archive_root() -> PathBuf {
+    std::env::var_os("ARCHIVE_BASE_PATH")
+        .map(PathBuf::from)
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("binance-archive")
 }
 
 async fn download_to(
@@ -189,7 +202,7 @@ mod tests {
         let info = FileInfo::parse(url).unwrap();
         assert_eq!(info.remote_url(), url);
         assert_eq!((info.year.as_str(), info.month.as_str()), ("2026", "04"));
-        assert!(info.local_path().ends_with(
+        assert!(info.local_path(Path::new("binance-archive")).ends_with(
             "binance-archive/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-04.zip"
         ));
         for bad in [

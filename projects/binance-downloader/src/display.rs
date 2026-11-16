@@ -27,13 +27,15 @@ struct State {
 
 pub struct Display {
     tty: bool,
+    quiet: bool,
     state: Mutex<State>,
 }
 
 impl Display {
-    pub fn new(progress: bool) -> Self {
+    pub fn new(progress: bool, quiet: bool) -> Self {
         Self {
-            tty: progress && io::stderr().is_terminal(),
+            tty: progress && !quiet && io::stderr().is_terminal(),
+            quiet,
             state: Mutex::new(State {
                 active: BTreeMap::new(),
                 next: 0,
@@ -91,6 +93,7 @@ impl Display {
     pub fn finish(&self, id: usize, outcome: Result<Outcome>) {
         let mut state = self.state.lock().unwrap();
         let item = state.active.remove(&id).unwrap();
+        let report = !self.quiet || outcome.is_err();
         let message = match outcome {
             Ok(Outcome::Downloaded) => {
                 state.downloaded += 1;
@@ -109,16 +112,20 @@ impl Display {
                 self.completion("FAILED", &item.name, &format!("{error:#}"))
             }
         };
-        self.draw(&mut state, Some(message));
+        if report {
+            self.draw(&mut state, Some(message));
+        }
     }
 
     pub fn summary(&self) -> usize {
         let mut state = self.state.lock().unwrap();
         self.clear(&mut state);
-        eprintln!(
-            "Finished: {} downloaded, {} existing, {} missing, {} failed, {} duplicates skipped",
-            state.downloaded, state.existing, state.missing, state.failed, state.duplicates
-        );
+        if !self.quiet {
+            eprintln!(
+                "Finished: {} downloaded, {} existing, {} missing, {} failed, {} duplicates skipped",
+                state.downloaded, state.existing, state.missing, state.failed, state.duplicates
+            );
+        }
         state.failed
     }
 

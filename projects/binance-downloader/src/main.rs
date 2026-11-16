@@ -4,7 +4,7 @@ mod processor;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, BufReader};
 
 #[derive(Parser)]
@@ -12,12 +12,18 @@ use tokio::io::{AsyncRead, BufReader};
 struct Args {
     /// File containing one Binance archive URL per line; omit or use - for stdin
     filename: Option<String>,
+    /// Archive root directory (files go under PATH/data/spot/monthly/klines)
+    #[arg(short = 'd', long, value_name = "PATH")]
+    destination: Option<PathBuf>,
     /// Maximum simultaneous downloads
     #[arg(short = 'j', long, default_value = "20", value_parser = clap::value_parser!(u16).range(1..=256))]
     jobs: u16,
     /// Print completion lines instead of an interactive display
     #[arg(long)]
     no_progress: bool,
+    /// Suppress progress and routine messages; errors remain visible
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 #[tokio::main]
@@ -27,17 +33,19 @@ async fn main() -> Result<()> {
         None | Some("-") => Box::new(tokio::io::stdin()),
         Some(filename) => Box::new(tokio::fs::File::open(filename).await?),
     };
+    let destination = Arc::new(args.destination.unwrap_or_else(paths::default_archive_root));
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(args.jobs as usize)
         .http2_adaptive_window(true)
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(3600))
         .build()?;
-    let display = Arc::new(display::Display::new(!args.no_progress));
+    let display = Arc::new(display::Display::new(!args.no_progress, args.quiet));
     let mut seen = HashSet::new();
     let result = processor::run(BufReader::new(reader), args.jobs as usize, |line| {
         let parsed = paths::FileInfo::parse(&line);
         let duplicate = parsed.as_ref().is_ok_and(|info| !seen.insert(info.clone()));
+        let destination = destination.clone();
         let client = client.clone();
         let display = display.clone();
         async move {
@@ -54,7 +62,9 @@ async fn main() -> Result<()> {
             };
             let id = display.start(info.filename.clone());
             let outcome = info
-                .download(&client, |bytes, total| display.progress(id, bytes, total))
+                .download(&client, &destination, |bytes, total| {
+                    display.progress(id, bytes, total)
+                })
                 .await;
             display.finish(id, outcome);
         }
