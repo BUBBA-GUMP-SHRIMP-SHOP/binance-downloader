@@ -69,3 +69,38 @@ microseconds from January 2025). Decimal values retain their precision as JSON
 numbers. Invalid numeric values or missing columns fail with HTTP 500 before the
 first row, or a body read error if streaming has begun. `/klines` continues to
 return the original CSV rows.
+
+### Fill missing minutes
+
+Add `?carry-forward=true` to `/klines-jsonl` to fill missing one-minute steps between
+returned rows. Each inserted row gets the missing `open_time` and copies all five
+other fields from the preceding row. The next real row replaces those values.
+Filling is incremental, including gaps across ZIP files and the 2025 timestamp
+unit transition. It does not add rows before the first real row or after the last.
+Omitting `carry-forward` or using `carry-forward=false` returns only archived rows.
+
+```bash
+curl --no-buffer 'http://127.0.0.1:8000/klines-jsonl?carry-forward=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:10","symbol":"BTCUSDT"}'
+```
+
+### Gain
+
+Add `?gain=true` to return the GAIN percentage for consecutive rows, using
+[Romeo Disca's GAIN formula](https://romeo-disca.medium.com/a-more-robust-kpi-for-profits-and-losses-c0aa5ea115c2).
+For each of `open`, `high`, `low`, `close`, and `volume`, let `r = later / former`:
+
+- `100 * (r - 1)` when `r >= 1`.
+- `100 * (1 - 1/r)` when `r < 1`.
+
+Each result keeps the former row's `open_time`. N input rows produce N−1 gain
+rows; empty or single-row inputs produce an empty response. Combine with
+`?carry-forward=true&gain=true` to fill gaps before calculating gain. Unchanged
+carried values produce zero gain.
+
+The calculation lives in `src/gain.rs`. Derived gains use finite floating-point
+numbers truncated toward zero to at most five decimal places (without padding
+trailing zeros). Equal nonnegative values, including two zeros, produce zero. Undefined
+zero transitions, negative values, and non-finite calculations produce JSON `null`
+for that field. Normal JSONL output keeps its original decimal precision.

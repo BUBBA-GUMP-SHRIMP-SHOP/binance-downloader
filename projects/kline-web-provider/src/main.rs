@@ -1,3 +1,5 @@
+mod gain;
+
 use kline_retriever::{PrimitiveDateTime, parse_date, publish_lines};
 use rocket::serde::{Deserialize, Serialize, json::Json};
 use rocket::tokio::{
@@ -78,10 +80,10 @@ fn archive_error(error: impl std::fmt::Display) -> ApiError {
 #[derive(Clone, Copy)]
 enum OutputFormat {
     Csv,
-    Jsonl,
+    Jsonl { carry_forward: bool, gain: bool },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(crate = "rocket::serde")]
 struct KlineJson {
     open_time: u64,
@@ -92,46 +94,141 @@ struct KlineJson {
     volume: serde_json::Number,
 }
 
-impl OutputFormat {
-    fn encode(self, line: String) -> io::Result<Vec<u8>> {
-        let mut bytes = match self {
-            Self::Csv => line.into_bytes(),
-            Self::Jsonl => {
-                let mut fields = line.split(',');
-                let open_time = fields
-                    .next()
-                    .unwrap_or("")
-                    .parse::<u64>()
-                    .map_err(io::Error::other)?;
-                let mut number = || -> io::Result<serde_json::Number> {
-                    fields
-                        .next()
-                        .ok_or_else(|| io::Error::other("missing kline column"))?
-                        .parse()
-                        .map_err(io::Error::other)
-                };
-                let record = KlineJson {
-                    open_time,
-                    open: number()?,
-                    high: number()?,
-                    low: number()?,
-                    close: number()?,
-                    volume: number()?,
-                };
-                serde_json::to_vec(&record).map_err(io::Error::other)?
-            }
+impl KlineJson {
+    fn parse(line: &str) -> io::Result<Self> {
+        let mut fields = line.split(',');
+        let open_time = fields
+            .next()
+            .unwrap_or("")
+            .parse::<u64>()
+            .map_err(io::Error::other)?;
+        let mut number = || -> io::Result<serde_json::Number> {
+            fields
+                .next()
+                .ok_or_else(|| io::Error::other("missing kline column"))?
+                .parse()
+                .map_err(io::Error::other)
         };
+        Ok(Self {
+            open_time,
+            open: number()?,
+            high: number()?,
+            low: number()?,
+            close: number()?,
+            volume: number()?,
+        })
+    }
+
+    // Spot archives switched timestamp units at 2025-01-01 UTC.
+    const MICROSECOND_START: u64 = 1_735_689_600_000_000;
+
+    fn micros(&self) -> io::Result<u64> {
+        if self.open_time >= Self::MICROSECOND_START {
+            Ok(self.open_time)
+        } else {
+            self.open_time
+                .checked_mul(1_000)
+                .ok_or_else(|| io::Error::other("timestamp overflow"))
+        }
+    }
+
+    fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
         bytes.push(b'\n');
         Ok(bytes)
     }
 }
 
+/// Calculate the five gains from later/former, keeping the former timestamp.
+fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    #[serde(crate = "rocket::serde")]
+    struct GainRow {
+        open_time: u64,
+        open: Option<f64>,
+        high: Option<f64>,
+        low: Option<f64>,
+        close: Option<f64>,
+        volume: Option<f64>,
+    }
+    let calculate = |former: &serde_json::Number, later: &serde_json::Number| {
+        gain::gain(former.as_f64()?, later.as_f64()?)
+    };
+    let row = GainRow {
+        open_time: former.open_time,
+        open: calculate(&former.open, &later.open),
+        high: calculate(&former.high, &later.high),
+        low: calculate(&former.low, &later.low),
+        close: calculate(&former.close, &later.close),
+        volume: calculate(&former.volume, &later.volume),
+    };
+    let mut bytes = serde_json::to_vec(&row).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 // Propagate publisher failures as body read errors if streaming has begun.
 struct KlineReader {
     format: OutputFormat,
+    previous: Option<KlineJson>,
+    next: Option<KlineJson>,
     receiver: mpsc::UnboundedReceiver<String>,
     publisher: Option<JoinHandle<anyhow::Result<u64>>>,
     pending: io::Cursor<Vec<u8>>,
+}
+
+impl KlineReader {
+    fn set_line(&mut self, line: String) -> io::Result<()> {
+        match self.format {
+            OutputFormat::Csv => self.pending = io::Cursor::new(format!("{line}\n").into_bytes()),
+            OutputFormat::Jsonl { .. } => self.set_record(KlineJson::parse(&line)?)?,
+        }
+        Ok(())
+    }
+
+    fn set_record(&mut self, record: KlineJson) -> io::Result<()> {
+        let output = if matches!(
+            self.format,
+            OutputFormat::Jsonl {
+                carry_forward: true,
+                ..
+            }
+        ) {
+            if let Some(previous) = &self.previous {
+                let next_time = previous
+                    .micros()?
+                    .checked_add(60_000_000)
+                    .ok_or_else(|| io::Error::other("timestamp overflow"))?;
+                if next_time < record.micros()? {
+                    let mut filled = previous.clone();
+                    filled.open_time = if next_time >= KlineJson::MICROSECOND_START {
+                        next_time
+                    } else {
+                        next_time / 1_000
+                    };
+                    self.next = Some(record);
+                    filled
+                } else {
+                    record
+                }
+            } else {
+                record
+            }
+        } else {
+            record
+        };
+        let bytes = if matches!(self.format, OutputFormat::Jsonl { gain: true, .. }) {
+            match &self.previous {
+                Some(former) => gain_row(former, &output)?,
+                None => Vec::new(),
+            }
+        } else {
+            output.encode()?
+        };
+        self.pending = io::Cursor::new(bytes);
+        self.previous = Some(output);
+        Ok(())
+    }
 }
 
 impl AsyncRead for KlineReader {
@@ -149,10 +246,14 @@ impl AsyncRead for KlineReader {
             if buf.filled().len() > before {
                 return Poll::Ready(Ok(()));
             }
+            if let Some(next) = self.next.take() {
+                self.set_record(next)?;
+                continue;
+            }
             match self.receiver.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(line)) => {
-                    self.pending = io::Cursor::new(self.format.encode(line)?)
+                    self.set_line(line)?;
                 }
                 Poll::Ready(None) => {
                     let Some(task) = self.publisher.as_mut() else {
@@ -226,12 +327,28 @@ async fn klines(
     Ok((ContentType::new("text", "csv"), ReaderStream::one(reader)))
 }
 
-#[rocket::post("/klines-jsonl", format = "json", data = "<range>")]
+#[derive(rocket::FromForm)]
+struct JsonlOptions {
+    #[field(name = "carry-forward")]
+    carry_forward: Option<bool>,
+    gain: Option<bool>,
+}
+
+#[rocket::post("/klines-jsonl?<options..>", format = "json", data = "<range>")]
 async fn klines_jsonl(
+    options: JsonlOptions,
     range: Json<DateRange>,
     root: &State<ArchiveRoot>,
 ) -> Result<(ContentType, ReaderStream![KlineReader]), ApiError> {
-    let reader = start_stream(range.into_inner(), root, OutputFormat::Jsonl).await?;
+    let reader = start_stream(
+        range.into_inner(),
+        root,
+        OutputFormat::Jsonl {
+            carry_forward: options.carry_forward.unwrap_or(false),
+            gain: options.gain.unwrap_or(false),
+        },
+    )
+    .await?;
     Ok((
         ContentType::new("application", "x-ndjson"),
         ReaderStream::one(reader),
@@ -291,17 +408,18 @@ async fn start_stream(
     } else {
         Some(publisher)
     };
-    let pending = first
-        .map(|line| format.encode(line))
-        .transpose()
-        .map_err(archive_error)?
-        .unwrap_or_default();
-    Ok(KlineReader {
+    let mut reader = KlineReader {
         format,
+        previous: None,
+        next: None,
         receiver,
         publisher,
-        pending: io::Cursor::new(pending),
-    })
+        pending: io::Cursor::new(Vec::new()),
+    };
+    if let Some(line) = first {
+        reader.set_line(line).map_err(archive_error)?;
+    }
+    Ok(reader)
 }
 
 #[get("/")]
@@ -533,6 +651,165 @@ mod tests {
         assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 
+    #[test]
+    fn jsonl_carry_forward_carries_values_only_between_real_rows() {
+        let root = tempfile::tempdir().unwrap();
+        write_month(
+            root.path(),
+            2025,
+            1,
+            b"1735689660000000,1.1234567890123456789,2,3,4,5\n1735689840000000,6,7,8,9,10\n",
+        );
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        let body =
+            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:05","symbol":"BTCUSDT"}"#;
+        for (query, expected) in [
+            ("", 2),
+            ("?carry-forward=false", 2),
+            ("?carry-forward=true", 4),
+        ] {
+            let response = client
+                .post(format!("/klines-jsonl{query}"))
+                .header(ContentType::JSON)
+                .body(body)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            let output = response.into_string().unwrap();
+            let rows: Vec<serde_json::Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), expected);
+            assert_eq!(rows[0]["open_time"], 1735689660000000_u64);
+            assert_eq!(rows.last().unwrap()["open_time"], 1735689840000000_u64);
+            if query == "?carry-forward=true" {
+                for (index, row) in rows.iter().enumerate() {
+                    assert_eq!(
+                        row["open_time"],
+                        1735689660000000_u64 + index as u64 * 60_000_000
+                    );
+                }
+                for row in &rows[1..3] {
+                    for name in ["open", "high", "low", "close", "volume"] {
+                        assert_eq!(row[name], rows[0][name]);
+                    }
+                }
+                assert_eq!(rows[3]["open"], 6);
+            }
+        }
+    }
+
+    #[test]
+    fn jsonl_carry_forward_handles_the_archive_timestamp_unit_transition() {
+        let root = tempfile::tempdir().unwrap();
+        write_month(root.path(), 2024, 12, b"1735689480000,1,2,3,4,5\n");
+        write_month(root.path(), 2025, 1, b"1735689720000000,6,7,8,9,10\n");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        let response = client.post("/klines-jsonl?carry-forward=true").header(ContentType::JSON)
+            .body(r#"{"startDate":"2024-12-31T23:58","endDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#).dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        let output = response.into_string().unwrap();
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let timestamps: Vec<u64> = rows
+            .iter()
+            .map(|row| row["open_time"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            timestamps,
+            [
+                1735689480000,
+                1735689540000,
+                1735689600000000,
+                1735689660000000,
+                1735689720000000
+            ]
+        );
+        for row in &rows[1..4] {
+            assert_eq!(row["close"], 4);
+        }
+        assert_eq!(rows[4]["close"], 9);
+    }
+
+    #[test]
+    fn jsonl_gain_uses_consecutive_rows_and_former_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        write_month(root.path(), 2025, 1, b"1735689600000000,100,200,80,100,0\n1735689660000000,125,100,100,100,5\n1735689720000000,100,200,80,50,0\n");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        let body =
+            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
+        let response = client
+            .post("/klines-jsonl?gain=true")
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        let output = response.into_string().unwrap();
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!({"open_time":1735689600000000_u64,"open":25.0,"high":-100.0,"low":25.0,"close":0.0,"volume":null}),
+                serde_json::json!({"open_time":1735689660000000_u64,"open":-25.0,"high":100.0,"low":-25.0,"close":-100.0,"volume":null}),
+            ]
+        );
+        let response = client
+            .post("/klines-jsonl?gain=false")
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch();
+        assert_eq!(response.into_string().unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn jsonl_applies_carry_forward_before_gain_and_omits_unpaired_rows() {
+        let root = tempfile::tempdir().unwrap();
+        write_month(
+            root.path(),
+            2025,
+            1,
+            b"1735689600000000,100,100,100,100,100\n1735689720000000,125,125,125,125,125\n",
+        );
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        let body =
+            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
+        let response = client
+            .post("/klines-jsonl?carry-forward=true&gain=true")
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        let output = response.into_string().unwrap();
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["open_time"], 1735689600000000_u64);
+        assert_eq!(rows[1]["open_time"], 1735689660000000_u64);
+        for field in ["open", "high", "low", "close", "volume"] {
+            assert_eq!(rows[0][field], 0.0);
+            assert_eq!(rows[1][field], 25.0);
+        }
+        for body in [
+            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:00","symbol":"BTCUSDT"}"#,
+            r#"{"startDate":"2025-01-01T00:01","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#,
+        ] {
+            let response = client
+                .post("/klines-jsonl?gain=true")
+                .header(ContentType::JSON)
+                .body(body)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            assert_eq!(response.into_string().unwrap(), "");
+        }
+    }
+
     #[rocket::async_test]
     async fn streaming_errors_are_propagated_after_buffered_rows() {
         use rocket::tokio::io::AsyncReadExt;
@@ -543,6 +820,8 @@ mod tests {
         });
         let mut reader = super::KlineReader {
             format: super::OutputFormat::Csv,
+            previous: None,
+            next: None,
             receiver,
             publisher: Some(publisher),
             pending: std::io::Cursor::new(Vec::new()),
