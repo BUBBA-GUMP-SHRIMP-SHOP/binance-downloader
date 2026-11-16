@@ -1050,8 +1050,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "archive",
+ "binance-downloader",
  "kline-retriever",
  "rocket",
+ "serde_json",
  "tempfile",
  "time",
  "zip",

@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 rocket = { version = "0.5.1", features = ["json"] }
+binance-downloader = { path = "../binance-downloader" }
 archive = { path = "../archive" }
 kline-retriever = { path = "../kline-retriever" }
 anyhow = "1.0.102"
 time = "0.3.55"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 
 [dev-dependencies]
 tempfile = "3"
