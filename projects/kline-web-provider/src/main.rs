@@ -173,6 +173,7 @@ fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
 
 // Propagate publisher failures as body read errors if streaming has begun.
 struct KlineReader {
+    remaining: Option<u64>,
     format: OutputFormat,
     previous: Option<KlineJson>,
     next: Option<KlineJson>,
@@ -182,9 +183,18 @@ struct KlineReader {
 }
 
 impl KlineReader {
+    fn set_output(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            if let Some(remaining) = &mut self.remaining {
+                *remaining -= 1;
+            }
+        }
+        self.pending = io::Cursor::new(bytes);
+    }
+
     fn set_line(&mut self, line: String) -> io::Result<()> {
         match self.format {
-            OutputFormat::Csv => self.pending = io::Cursor::new(format!("{line}\n").into_bytes()),
+            OutputFormat::Csv => self.set_output(format!("{line}\n").into_bytes()),
             OutputFormat::Jsonl { .. } => self.set_record(KlineJson::parse(&line)?)?,
         }
         Ok(())
@@ -230,7 +240,7 @@ impl KlineReader {
         } else {
             output.encode()?
         };
-        self.pending = io::Cursor::new(bytes);
+        self.set_output(bytes);
         self.previous = Some(output);
         Ok(())
     }
@@ -249,6 +259,14 @@ impl AsyncRead for KlineReader {
             let before = buf.filled().len();
             std::task::ready!(Pin::new(&mut self.pending).poll_read(cx, buf))?;
             if buf.filled().len() > before {
+                return Poll::Ready(Ok(()));
+            }
+            if self.remaining == Some(0) {
+                self.receiver.close();
+                if let Some(task) = self.publisher.take() {
+                    task.abort();
+                }
+                self.next = None;
                 return Poll::Ready(Ok(()));
             }
             if let Some(next) = self.next.take() {
@@ -280,14 +298,31 @@ impl AsyncRead for KlineReader {
 #[derive(Deserialize, Serialize)]
 #[serde(crate = "rocket::serde", rename_all = "camelCase", deny_unknown_fields)]
 struct DateRange {
-    start_date: MinuteDateTime,
     #[serde(
         default,
         deserialize_with = "deserialize_optional",
         skip_serializing_if = "Option::is_none"
     )]
     end_date: Option<MinuteDateTime>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    start_date: Option<MinuteDateTime>,
     symbol: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    clusters: Option<std::num::NonZeroU64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    window: Option<u64>,
 }
 
 fn deserialize_optional<'de, T: Deserialize<'de>, D: rocket::serde::Deserializer<'de>>(
@@ -360,22 +395,84 @@ async fn klines_jsonl(
     ))
 }
 
+fn clamp_date_range(
+    earlier: PrimitiveDateTime,
+    later: PrimitiveDateTime,
+) -> Result<PrimitiveDateTime, ApiError> {
+    if earlier > later {
+        return Err(invalid("endDate must not follow startDate"));
+    }
+    let (year, month) = if later.month() == time::Month::January {
+        (later.year() - 1, time::Month::December)
+    } else {
+        (later.year(), later.month().previous())
+    };
+    // Clamp month-end dates, e.g. March 31 maps to February 28 or 29.
+    let mut day = later.day();
+    let earliest_date = loop {
+        if let Ok(date) = time::Date::from_calendar_date(year, month, day) {
+            break date;
+        }
+        if day == 1 {
+            // The previous month is outside the representable date range.
+            return Ok(earlier);
+        }
+        day -= 1;
+    };
+    Ok(earlier.max(PrimitiveDateTime::new(earliest_date, later.time())))
+}
+
+fn apply_window(
+    earlier: PrimitiveDateTime,
+    later: PrimitiveDateTime,
+    window: Option<u64>,
+) -> PrimitiveDateTime {
+    if let Some(minutes) = window {
+        if i128::from(minutes) * 60_000_000_000 < (later - earlier).whole_nanoseconds() {
+            // The comparison bounds minutes to the supported date span.
+            return later - time::Duration::minutes(minutes as i64);
+        }
+    }
+    earlier
+}
+
+fn expand_clusters(
+    earlier: PrimitiveDateTime,
+    later: PrimitiveDateTime,
+    clusters: u64,
+) -> Result<PrimitiveDateTime, ApiError> {
+    let duration = (later - earlier)
+        .whole_nanoseconds()
+        .checked_mul(i128::from(clusters))
+        .ok_or_else(|| invalid("clusters extends beyond the supported date range"))?;
+    let timestamp = later
+        .assume_utc()
+        .unix_timestamp_nanos()
+        .checked_sub(duration)
+        .ok_or_else(|| invalid("clusters extends beyond the supported date range"))?;
+    let date = time::OffsetDateTime::from_unix_timestamp_nanos(timestamp)
+        .map_err(|_| invalid("clusters extends beyond the supported date range"))?;
+    Ok(PrimitiveDateTime::new(date.date(), date.time()))
+}
+
 async fn start_stream(
     range: DateRange,
     root: &ArchiveRoot,
     format: OutputFormat,
 ) -> Result<KlineReader, ApiError> {
-    let start = parse_date(&range.start_date.0).map_err(invalid)?;
-    let end = match &range.end_date {
+    let start = match &range.end_date {
+        Some(date) => parse_date(&date.0).map_err(invalid)?,
+        // Clamping chooses one calendar month before the resolved startDate.
+        None => PrimitiveDateTime::MIN,
+    };
+    let end = match &range.start_date {
         Some(date) => parse_date(&date.0).map_err(invalid)?,
         None => {
             let now = time::OffsetDateTime::now_utc();
             PrimitiveDateTime::new(now.date(), now.time())
         }
     };
-    if start > end {
-        return Err(invalid("startDate must not follow endDate"));
-    }
+    let start = clamp_date_range(start, end)?;
     if range.symbol.is_empty()
         || !range
             .symbol
@@ -384,6 +481,28 @@ async fn start_stream(
     {
         return Err(invalid("invalid symbol"));
     }
+    if range.window == Some(0) {
+        return Ok(KlineReader {
+            remaining: Some(0),
+            format,
+            previous: None,
+            next: None,
+            receiver: mpsc::unbounded_channel().1,
+            publisher: None,
+            pending: io::Cursor::new(Vec::new()),
+        });
+    }
+    let start = apply_window(start, end, range.window);
+    let clusters = range.clusters.map_or(1, |value| value.get());
+    let window = range
+        .window
+        .map(|window| {
+            window
+                .checked_mul(clusters)
+                .ok_or_else(|| invalid("window times clusters exceeds the supported line count"))
+        })
+        .transpose()?;
+    let start = expand_clusters(start, end, clusters)?;
     // Keep the gate until downloads finish even if this request disconnects.
     let download_root = root.0.clone();
     let download_symbol = range.symbol.clone();
@@ -414,6 +533,7 @@ async fn start_stream(
         Some(publisher)
     };
     let mut reader = KlineReader {
+        remaining: window,
         format,
         previous: None,
         next: None,
@@ -498,10 +618,9 @@ mod tests {
             };
         }
         write_zip(root.path());
-        for body in [
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00","symbol":"BTCUSDT"}"#,
-        ] {
+        for body in
+            [r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#]
+        {
             let response = client
                 .post("/klines")
                 .header(ContentType::JSON)
@@ -520,27 +639,270 @@ mod tests {
     }
 
     #[test]
+    fn date_ranges_are_clamped_to_one_calendar_month() {
+        for (earlier, later, expected) in [
+            ("2025-01-01T12:00", "2025-02-01T12:00", "2025-01-01T12:00"),
+            ("2025-01-01T11:59", "2025-02-01T12:00", "2025-01-01T12:00"),
+            ("2025-01-01T00:00", "2025-03-31T12:00", "2025-02-28T12:00"),
+            ("2024-01-01T00:00", "2024-03-31T12:00", "2024-02-29T12:00"),
+            ("2024-01-01T00:00", "2025-01-31T12:00", "2024-12-31T12:00"),
+            ("2025-01-15T12:00", "2025-02-01T12:00", "2025-01-15T12:00"),
+            ("2025-01-01T12:00", "2025-01-01T12:00", "2025-01-01T12:00"),
+        ] {
+            assert_eq!(
+                super::clamp_date_range(
+                    super::parse_date(earlier).unwrap(),
+                    super::parse_date(later).unwrap(),
+                )
+                .unwrap(),
+                super::parse_date(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn endpoints_trim_ranges_longer_than_one_month() {
+        let root = tempfile::tempdir().unwrap();
+        // One row before the clamped boundary and one exactly at it.
+        write_month(
+            root.path(),
+            2025,
+            1,
+            b"1735689600000000,1,2,3,4,5\n1735689660000000,6,7,8,9,10\n",
+        );
+        write_month(root.path(), 2025, 2, b"");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for route in ["/klines", "/klines-jsonl"] {
+            let response = client.post(route).header(ContentType::JSON)
+                .body(r#"{"endDate":"2020-01-01T00:00","startDate":"2025-02-01T00:01","symbol":"BTCUSDT","clusters":1}"#)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            let body = response.into_string().unwrap();
+            assert!(!body.contains("1735689600000000"));
+            assert!(body.contains("1735689660000000"));
+        }
+    }
+
+    #[test]
+    fn endpoints_default_omitted_end_date_to_one_month_before_start() {
+        let root = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        for year in [now.year() - 1, now.year()] {
+            for month in 1..=12 {
+                write_month(root.path(), year, month, b"");
+            }
+        }
+        write_month(
+            root.path(),
+            2025,
+            1,
+            b"1735689600000000,1,2,3,4,5\n1735689660000000,6,7,8,9,10\n",
+        );
+        write_month(root.path(), 2025, 2, b"");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for route in ["/klines", "/klines-jsonl"] {
+            let response = client
+                .post(route)
+                .header(ContentType::JSON)
+                .body(r#"{"startDate":"2025-02-01T00:01","symbol":"BTCUSDT"}"#)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            let body = response.into_string().unwrap();
+            assert!(!body.contains("1735689600000000"));
+            assert!(body.contains("1735689660000000"));
+            let response = client
+                .post(route)
+                .header(ContentType::JSON)
+                .body(r#"{"symbol":"BTCUSDT"}"#)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+        }
+    }
+
+    #[test]
+    fn window_limits_output_lines_within_the_date_range() {
+        let root = tempfile::tempdir().unwrap();
+        write_month(root.path(), 2025, 1,
+            b"1735689600000000,1,2,3,4,5\n1735689660000000,6,7,8,9,10\n1735689780000000,6,7,8,9,10\n");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for (route, available, last_minute) in [
+            ("/klines", 2, "01"),
+            ("/klines-jsonl", 2, "01"),
+            ("/klines-jsonl?carry-forward=true", 4, "03"),
+            ("/klines-jsonl?gain=true", 1, "01"),
+            ("/klines-jsonl?carry-forward=true&gain=true", 3, "03"),
+        ] {
+            for window in [0, 1, 2, 3, 100] {
+                let body = format!(
+                    r#"{{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:{last_minute}","symbol":"BTCUSDT","window":{window}}}"#
+                );
+                let response = client
+                    .post(route)
+                    .header(ContentType::JSON)
+                    .body(body)
+                    .dispatch();
+                assert_eq!(response.status(), Status::Ok);
+                assert_eq!(
+                    response.into_string().unwrap().lines().count(),
+                    if route == "/klines-jsonl?carry-forward=true&gain=true" && window == 1 {
+                        // Only the final real row lies in this shortened range.
+                        0
+                    } else {
+                        window.min(available)
+                    }
+                );
+            }
+            for window in ["-1", "1.5", "null", "\"2\""] {
+                let body = format!(r#"{{"symbol":"BTCUSDT","window":{window}}}"#);
+                assert_eq!(
+                    client
+                        .post(route)
+                        .header(ContentType::JSON)
+                        .body(body)
+                        .dispatch()
+                        .status(),
+                    Status::UnprocessableEntity
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ten_line_window_with_three_clusters_returns_thirty_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let rows: String = (0..=60)
+            .map(|minute| {
+                format!(
+                    "{},1,2,3,4,5\n",
+                    1_735_689_600_000_000u64 + minute * 60_000_000
+                )
+            })
+            .collect();
+        write_month(root.path(), 2025, 1, rows.as_bytes());
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for route in [
+            "/klines",
+            "/klines-jsonl",
+            "/klines-jsonl?gain=true",
+            "/klines-jsonl?carry-forward=true&gain=true",
+        ] {
+            let response = client.post(route).header(ContentType::JSON)
+                .body(r#"{"symbol":"BTCUSDT","startDate":"2025-01-01T01:00","window":10,"clusters":3}"#)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            let body = response.into_string().unwrap();
+            assert_eq!(body.lines().count(), 30);
+            // startDate 01:00 minus (10 minutes * 3) = endDate 00:30.
+            assert!(body.lines().next().unwrap().contains("1735691400000000"));
+        }
+    }
+
+    #[test]
+    fn clusters_are_applied_after_other_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for route in ["/klines", "/klines-jsonl"] {
+            // This multiplier would overflow the supported date range if applied.
+            let response = client
+                .post(route)
+                .header(ContentType::JSON)
+                .body(r#"{"symbol":"BTCUSDT","window":0,"clusters":18446744073709551615}"#)
+                .dispatch();
+            assert_eq!(response.status(), Status::Ok);
+            assert_eq!(response.into_string().unwrap(), "");
+            let response = client
+                .post(route)
+                .header(ContentType::JSON)
+                .body(r#"{"symbol":"../BTCUSDT","clusters":18446744073709551615}"#)
+                .dispatch();
+            assert_eq!(response.status(), Status::UnprocessableEntity);
+            assert_eq!(response.into_string().unwrap(), "invalid symbol");
+        }
+    }
+
+    #[test]
+    fn window_recalculates_end_date_before_clusters() {
+        let end = super::parse_date("2025-01-01T01:00").unwrap();
+        let earlier = super::parse_date("2025-01-01T00:00").unwrap();
+        let start = super::apply_window(earlier, end, Some(10));
+        assert_eq!(start, super::parse_date("2025-01-01T00:50").unwrap());
+        assert_eq!(
+            super::expand_clusters(start, end, 3).unwrap(),
+            super::parse_date("2025-01-01T00:30").unwrap()
+        );
+        assert_eq!(super::apply_window(start, end, Some(100)), start);
+        assert_eq!(super::apply_window(start, end, None), start);
+        assert_eq!(super::apply_window(start, end, Some(u64::MAX)), start);
+    }
+
+    #[test]
+    fn clusters_expand_after_clamping() {
+        let later = super::parse_date("2025-03-31T12:00").unwrap();
+        let earlier = super::parse_date("2020-01-01T00:00").unwrap();
+        let clamped = super::clamp_date_range(earlier, later).unwrap();
+        assert_eq!(super::expand_clusters(clamped, later, 1).unwrap(), clamped);
+        assert_eq!(
+            super::expand_clusters(clamped, later, 3).unwrap(),
+            later - (later - clamped) * 3
+        );
+        assert!(super::expand_clusters(clamped, later, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn clusters_expand_endpoint_ranges_and_window_limit() {
+        let root = tempfile::tempdir().unwrap();
+        write_month(root.path(), 2025, 1,
+            b"1735689600000000,1,2,3,4,5\n1735689660000000,6,7,8,9,10\n1735689720000000,6,7,8,9,10\n1735689780000000,6,7,8,9,10\n");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for route in ["/klines", "/klines-jsonl"] {
+            for (clusters, window, expected) in [(1, 100, 2), (3, 100, 4), (3, 2, 4)] {
+                let body = format!(
+                    r#"{{"symbol":"BTCUSDT","endDate":"2025-01-01T00:02","startDate":"2025-01-01T00:03","clusters":{clusters},"window":{window}}}"#
+                );
+                let response = client
+                    .post(route)
+                    .header(ContentType::JSON)
+                    .body(body)
+                    .dispatch();
+                assert_eq!(response.status(), Status::Ok);
+                assert_eq!(response.into_string().unwrap().lines().count(), expected);
+            }
+            for clusters in ["0", "-1", "1.5", "null", "\"3\"", "{}"] {
+                let body = format!(r#"{{"symbol":"BTCUSDT","clusters":{clusters}}}"#);
+                assert_eq!(
+                    client
+                        .post(route)
+                        .header(ContentType::JSON)
+                        .body(body)
+                        .dispatch()
+                        .status(),
+                    Status::UnprocessableEntity
+                );
+            }
+        }
+    }
+
+    #[test]
     fn klines_rejects_schema_violations() {
         let root = tempfile::tempdir().unwrap();
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         for body in [
-            r#"{"startDate":"2025-01-01T00:00"}"#,
-            r#"{"symbol":"BTCUSDT"}"#,
-            r#"{"startDate":null,"symbol":"BTCUSDT"}"#,
-            r#"{"startDate":123,"symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00","extra":true,"symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2026-11-16","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2026-11-16T24:00","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2026-11-16T14:60","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00:00","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00Z","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00","endDate":"invalid","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00","endDate":null,"symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00","symbol":123}"#,
-            r#"{"startDate":"2025-01-01T00:00","symbol":null}"#,
-            r#"{"startDate":"2025-02-30T00:00","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:01","endDate":"2025-01-01T00:00","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:00","symbol":"../BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00"}"#,
+            r#"{"endDate":null,"symbol":"BTCUSDT"}"#,
+            r#"{"endDate":123,"symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00","extra":true,"symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2026-11-16","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2026-11-16T24:00","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2026-11-16T14:60","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00:00","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00Z","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00","startDate":"invalid","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00","startDate":null,"symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00","symbol":123}"#,
+            r#"{"endDate":"2025-01-01T00:00","symbol":null}"#,
+            r#"{"endDate":"2025-02-30T00:00","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:01","startDate":"2025-01-01T00:00","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00","symbol":"../BTCUSDT"}"#,
         ] {
             let response = client
                 .post("/klines")
@@ -556,7 +918,7 @@ mod tests {
         write_month(root.path(), 2025, 1, b"");
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let body =
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#;
+            r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#;
         let response = client
             .post("/klines")
             .header(ContentType::JSON)
@@ -582,7 +944,7 @@ mod tests {
         std::fs::create_dir_all(path).unwrap();
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let response = client.post("/klines").header(ContentType::JSON)
-            .body(r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#)
+            .body(r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#)
             .dispatch();
         // The directory also fails retrieval, which retains its own HTTP 500.
         assert_eq!(response.status(), Status::InternalServerError);
@@ -596,7 +958,7 @@ mod tests {
             b"1735689600000000,1234567890.123456789,2.50,0.10,1.25,100.00000001,unused,unused,unused,unused,unused,unused\n1735689660000000,6,7,8,9,10,ignored\n");
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let response = client.post("/klines-jsonl").header(ContentType::JSON)
-            .body(r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#)
+            .body(r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#)
             .dispatch();
         assert_eq!(response.status(), Status::Ok);
         assert_eq!(
@@ -628,7 +990,7 @@ mod tests {
         write_month(root.path(), 2025, 1, b"");
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let body =
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#;
+            r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#;
         let response = client
             .post("/klines-jsonl")
             .header(ContentType::JSON)
@@ -652,7 +1014,7 @@ mod tests {
         let response = client
             .post("/klines-jsonl")
             .header(ContentType::JSON)
-            .body(r#"{"startDate":"2025-01-01T00:00"}"#)
+            .body(r#"{"endDate":"2025-01-01T00:00"}"#)
             .dispatch();
         assert_eq!(response.status(), Status::UnprocessableEntity);
     }
@@ -668,7 +1030,7 @@ mod tests {
         );
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let body =
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:05","symbol":"BTCUSDT"}"#;
+            r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:05","symbol":"BTCUSDT"}"#;
         for (query, expected) in [
             ("", 2),
             ("?carry-forward=false", 2),
@@ -715,7 +1077,7 @@ mod tests {
         write_month(root.path(), 2025, 1, b"1735689720000000,6,7,8,9,10\n");
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let response = client.post("/klines-jsonl?carry-forward=true").header(ContentType::JSON)
-            .body(r#"{"startDate":"2024-12-31T23:58","endDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#).dispatch();
+            .body(r#"{"endDate":"2024-12-31T23:58","startDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#).dispatch();
         assert_eq!(response.status(), Status::Ok);
         let output = response.into_string().unwrap();
         let rows: Vec<serde_json::Value> = output
@@ -748,7 +1110,7 @@ mod tests {
         write_month(root.path(), 2025, 1, b"1735689600000000,100,200,80,100,0\n1735689660000000,125,100,100,100,5\n1735689720000000,100,200,80,50,0\n");
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let body =
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
+            r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
         let response = client
             .post("/klines-jsonl?gain=true")
             .header(ContentType::JSON)
@@ -786,7 +1148,7 @@ mod tests {
         );
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let body =
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
+            r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
         let response = client
             .post("/klines-jsonl?carry-forward=true&gain=true")
             .header(ContentType::JSON)
@@ -808,8 +1170,8 @@ mod tests {
             assert_eq!(rows[1][field], 25.0);
         }
         for body in [
-            r#"{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:00","symbol":"BTCUSDT"}"#,
-            r#"{"startDate":"2025-01-01T00:01","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:00","symbol":"BTCUSDT"}"#,
+            r#"{"endDate":"2025-01-01T00:01","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}"#,
         ] {
             let response = client
                 .post("/klines-jsonl?gain=true")
@@ -830,6 +1192,7 @@ mod tests {
             Err(anyhow::anyhow!("archive read failed"))
         });
         let mut reader = super::KlineReader {
+            remaining: None,
             format: super::OutputFormat::Csv,
             previous: None,
             next: None,

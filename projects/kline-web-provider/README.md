@@ -19,13 +19,29 @@ The server listens at `http://127.0.0.1:8000` by default:
 ```bash
 curl http://127.0.0.1:8000/klines \
   -H 'Content-Type: application/json' \
-  -d '{"startDate":"2026-11-16T14:30","endDate":"2026-11-17T18:00","symbol":"BTCUSDT"}'
+  -d '{"endDate":"2026-11-16T14:30","startDate":"2026-11-17T18:00","symbol":"BTCUSDT"}'
 ```
 
-`startDate` and `symbol` are required; `endDate` may be omitted and defaults to
-current UTC time. Dates use `YYYY-MM-DDTHH:MM` and are interpreted as UTC. The
+`symbol` is required. Both dates are optional: `startDate` defaults to current
+UTC time, and `endDate` defaults to one calendar month before `startDate`. `endDate` must be on or before `startDate`. Earlier values are automatically
+trimmed to one calendar month before `startDate` (clamped to the last day of
+the previous month), including when `startDate` defaults to now. Dates use `YYYY-MM-DDTHH:MM` and are interpreted as UTC. The
 inclusive range filters rows by their opening timestamp. Symbols may contain only
 ASCII letters, digits, and underscores, and must not be empty.
+Optional `window` is a nonnegative integer limiting output lines after any
+carry-forward and gain processing. Omit it for all available rows; `0` returns
+an empty response. Fewer rows are returned when the resolved date range has
+insufficient data. Before applying clusters, `window` also shortens the base
+date range to at most that many minutes before `startDate`, preserving any
+shorter given range. For `window: 10` and `clusters: 3`, the recalculated
+`endDate` is 30 minutes before `startDate` when the base range permits it.
+Optional `clusters` is a positive integer (default `1`). After all date, symbol, and zero-window checks, it multiplies the resolved
+base window (clamped to one calendar month), extending that
+window's duration by moving `endDate` backward, keeping `startDate` fixed.
+For example, a one-day window with `clusters: 3` becomes three days. This final
+window can exceed one month. The output line cap is also multiplied: `window: 10` with `clusters: 3`
+returns up to 30 lines from the expanded date range.
+Invalid cluster values or expansion beyond the supported date range return HTTP 422.
 
 The archive root follows the shared `archive` crate: `ARCHIVE_BASE_PATH`, then the
 OS data directory, then the current directory, with `binance-archive` appended.
@@ -54,7 +70,7 @@ failures remain silent and only available data is returned.
 ```bash
 curl --no-buffer http://127.0.0.1:8000/klines-jsonl \
   -H 'Content-Type: application/json' \
-  -d '{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}'
+  -d '{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","symbol":"BTCUSDT"}'
 ```
 
 The response is `application/x-ndjson`, one JSON object per line, containing
@@ -82,7 +98,7 @@ Omitting `carry-forward` or using `carry-forward=false` returns only archived ro
 ```bash
 curl --no-buffer 'http://127.0.0.1:8000/klines-jsonl?carry-forward=true' \
   -H 'Content-Type: application/json' \
-  -d '{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:10","symbol":"BTCUSDT"}'
+  -d '{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:10","symbol":"BTCUSDT"}'
 ```
 
 ### Gain
