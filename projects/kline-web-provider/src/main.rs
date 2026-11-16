@@ -1,4 +1,5 @@
 mod gain;
+mod rapido;
 
 use kline_retriever::{PrimitiveDateTime, parse_date, publish_lines};
 use rocket::serde::{Deserialize, Serialize, json::Json};
@@ -363,7 +364,7 @@ async fn klines(
     range: Json<DateRange>,
     root: &State<ArchiveRoot>,
 ) -> Result<(ContentType, ReaderStream![KlineReader]), ApiError> {
-    let reader = start_stream(range.into_inner(), root, OutputFormat::Csv).await?;
+    let reader = start_stream(range.into_inner(), root, OutputFormat::Csv, false).await?;
     Ok((ContentType::new("text", "csv"), ReaderStream::one(reader)))
 }
 
@@ -387,11 +388,38 @@ async fn klines_jsonl(
             carry_forward: options.carry_forward.unwrap_or(false),
             gain: options.gain.unwrap_or(false),
         },
+        false,
     )
     .await?;
     Ok((
         ContentType::new("application", "x-ndjson"),
         ReaderStream::one(reader),
+    ))
+}
+
+#[rocket::post("/indi-jsonl", format = "json", data = "<range>")]
+async fn indi_jsonl(
+    range: Json<DateRange>,
+    root: &State<ArchiveRoot>,
+) -> Result<(ContentType, ReaderStream![rapido::Reader<KlineReader>]), ApiError> {
+    let range = range.into_inner();
+    let window = range
+        .window
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid("indi-jsonl requires a positive window"))?;
+    let reader = start_stream(
+        range,
+        root,
+        OutputFormat::Jsonl {
+            carry_forward: true,
+            gain: true,
+        },
+        true,
+    )
+    .await?;
+    Ok((
+        ContentType::new("application", "x-ndjson"),
+        ReaderStream::one(rapido::Reader::new(reader, window)),
     ))
 }
 
@@ -459,6 +487,7 @@ async fn start_stream(
     range: DateRange,
     root: &ArchiveRoot,
     format: OutputFormat,
+    require_downloads: bool,
 ) -> Result<KlineReader, ApiError> {
     let start = match &range.end_date {
         Some(date) => parse_date(&date.0).map_err(invalid)?,
@@ -507,12 +536,21 @@ async fn start_stream(
     let download_root = root.0.clone();
     let download_symbol = range.symbol.clone();
     let gate = root.1.clone();
-    // Download failures do not prevent serving whatever is available locally.
-    let _ = tokio::spawn(async move {
+    // Finish preparation before creating a publisher or reading any rows.
+    let preparation = tokio::spawn(async move {
         let _guard = gate.lock().await;
         ensure_downloaded(&download_root, &download_symbol, start, end).await
     })
     .await;
+    if require_downloads {
+        preparation.map_err(archive_error)?.map_err(|error| {
+            eprintln!("Required archive download failed: {error:#}");
+            status::Custom(
+                Status::ServiceUnavailable,
+                "Required archive download failed".into(),
+            )
+        })?;
+    }
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let publisher = tokio::spawn(publish_lines(
         root.0.clone(),
@@ -568,7 +606,10 @@ fn build_rocket(root: PathBuf) -> Rocket<Build> {
             root,
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
         ))
-        .mount("/", routes![index, health, klines, klines_jsonl])
+        .mount(
+            "/",
+            routes![index, health, klines, klines_jsonl, indi_jsonl],
+        )
 }
 
 #[cfg(test)]
@@ -795,6 +836,99 @@ mod tests {
             // startDate 01:00 minus (10 minutes * 3) = endDate 00:30.
             assert!(body.lines().next().unwrap().contains("1735691400000000"));
         }
+    }
+
+    #[test]
+    fn indi_jsonl_aggregates_three_windows_after_carry_forward_and_gain() {
+        let root = tempfile::tempdir().unwrap();
+        let rows: String = (0..=30)
+            .map(|index| {
+                let value = 2u64.pow(index);
+                format!(
+                    "{},{value},{value},{value},{value},{value}\n",
+                    1_735_689_600_000_000u64 + u64::from(index) * 120_000_000
+                )
+            })
+            .collect();
+        write_month(root.path(), 2025, 1, rows.as_bytes());
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        let response = client
+            .post("/indi-jsonl")
+            .header(ContentType::JSON)
+            .body(r#"{"symbol":"BTCUSDT","startDate":"2025-01-01T01:00","window":10,"clusters":3}"#)
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.content_type(),
+            Some(ContentType::new("application", "x-ndjson"))
+        );
+        let body = response.into_string().unwrap();
+        let windows: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(windows.len(), 3);
+        for (index, window) in windows.iter().enumerate() {
+            assert_eq!(
+                window["open_time"],
+                1_735_691_400_000_000u64 + index as u64 * 600_000_000
+            );
+            assert_eq!(window["window"], 10);
+            assert_eq!(window["interpolated"], 0.5);
+            for field in ["s_open", "s_low", "v_open", "v_low"] {
+                assert_eq!(window[field], 0.0);
+            }
+            for field in ["s_high", "s_close", "v_high", "v_close"] {
+                assert_eq!(window[field], 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn indi_jsonl_requires_all_downloads_before_aggregation() {
+        let root = tempfile::tempdir().unwrap();
+        // The older month contains sufficient data to produce an aggregate,
+        // but preparation of the later required month must fail first.
+        write_zip(root.path());
+        let blocked = archive::monthly_kline_path(root.path(), "BTCUSDT", "BTCUSDT-1m-2025-02.zip");
+        std::fs::create_dir_all(blocked).unwrap();
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        let response = client
+            .post("/indi-jsonl")
+            .header(ContentType::JSON)
+            .body(r#"{"symbol":"BTCUSDT","startDate":"2025-02-01T00:00","window":44640}"#)
+            .dispatch();
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(
+            response.into_string().unwrap(),
+            "Required archive download failed"
+        );
+    }
+
+    #[test]
+    fn indi_jsonl_requires_window_and_omits_incomplete_groups() {
+        let root = tempfile::tempdir().unwrap();
+        write_zip(root.path());
+        write_month(root.path(), 2024, 12, b"");
+        let client = Client::tracked(build_rocket(root.path().into())).unwrap();
+        for body in [
+            r#"{"symbol":"BTCUSDT"}"#,
+            r#"{"symbol":"BTCUSDT","window":0}"#,
+        ] {
+            assert_eq!(
+                client
+                    .post("/indi-jsonl")
+                    .header(ContentType::JSON)
+                    .body(body)
+                    .dispatch()
+                    .status(),
+                Status::UnprocessableEntity
+            );
+        }
+        let response = client.post("/indi-jsonl").header(ContentType::JSON)
+            .body(r#"{"symbol":"BTCUSDT","endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:01","window":10,"clusters":3}"#).dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().unwrap(), "");
     }
 
     #[test]

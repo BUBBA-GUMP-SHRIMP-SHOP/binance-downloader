@@ -124,3 +124,40 @@ for that field. Normal JSONL output keeps its original decimal precision.
 Every JSONL row includes `interpolated`: `0.0` for an original archive row and
 `1.0` for a row inserted by carry-forward. Gain output retains the former row's
 marker, matching its `open_time`; this marker is not part of the gain calculation.
+
+## INDI JSONL aggregation
+
+`POST /indi-jsonl` first queues and awaits all monthly downloads required by the
+fully resolved, cluster-expanded date range. Existing nonempty archives are
+reused. Download preparation must succeed before any archive reader, gain
+processing, or aggregation starts. A failed required download (including HTTP
+404) returns HTTP 503 instead of serving partial data.
+
+`POST /indi-jsonl` accepts the same JSON body, requires a positive `window`, and
+always applies carry-forward followed by gain, equivalent to
+`/klines-jsonl?carry-forward=true&gain=true`. It then groups consecutive gain rows
+into nonoverlapping windows of `window` rows, producing up to `clusters` NDJSON
+lines (`clusters` defaults to 1). It emits complete windows only; insufficient
+available data can result in fewer lines, including an empty response.
+
+```bash
+curl --no-buffer http://localhost:8000/indi-jsonl \
+  -H 'Content-Type: application/json' \
+  -d '{"startDate":"2026-07-01T00:00","window":10,"clusters":3,"symbol":"BTCUSDT"}'
+```
+
+This request resolves `endDate` to `2026-06-30T23:30` and aggregates the 30 gain
+rows into three windows of ten, when all required data is available.
+Each output object contains:
+
+- `open_time`: the first gain row's opening timestamp, preserving archive units.
+- `window`: the number of gain rows in the aggregation.
+- `interpolated`: the sum of the rows' interpolation markers divided by `window`.
+- `s_open`, `s_high`, `s_low`, `s_close`: first `open`, maximum `high`, minimum
+  `low`, and last `close` across the gain rows, respectively.
+- `v_open`, `v_high`, `v_low`, `v_close`: first, maximum, minimum, and last volume
+  gain, respectively.
+
+Undefined gains retain JSON `null`. An extremum is `null` if any contributing
+value for that extremum is undefined. Open and close preserve the first and last
+values, including nulls. Upstream streaming errors propagate as body read errors.
