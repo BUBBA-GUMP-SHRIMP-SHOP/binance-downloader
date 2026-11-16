@@ -1,0 +1,14 @@
+[package]
+name = "kline-retriever"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+archive = { path = "../archive" }
+anyhow = "1.0.102"
+time = { version = "0.3.55", features = ["parsing"] }
+tokio = { version = "1.51.1", features = ["rt", "macros", "sync"] }
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

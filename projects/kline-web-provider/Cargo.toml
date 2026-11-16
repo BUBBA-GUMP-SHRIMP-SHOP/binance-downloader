@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 rocket = { version = "0.5.1", features = ["json"] }
+archive = { path = "../archive" }
+kline-retriever = { path = "../kline-retriever" }
+anyhow = "1.0.102"
+time = "0.3.55"
+
+[dev-dependencies]
+tempfile = "3"
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }

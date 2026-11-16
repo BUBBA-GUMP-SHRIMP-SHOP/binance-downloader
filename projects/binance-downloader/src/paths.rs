@@ -82,11 +82,7 @@ impl FileInfo {
     }
 
     pub fn local_path(&self, archive_root: &Path) -> PathBuf {
-        archive_root
-            .join("data/spot/monthly/klines")
-            .join(&self.symbol)
-            .join("1m")
-            .join(&self.filename)
+        archive::monthly_kline_path(archive_root, &self.symbol, &self.filename)
     }
 
     pub async fn download(
@@ -103,15 +99,6 @@ impl FileInfo {
         )
         .await
     }
-}
-
-/// Preserve the existing environment/OS default when no CLI destination is given.
-pub fn default_archive_root() -> PathBuf {
-    std::env::var_os("ARCHIVE_BASE_PATH")
-        .map(PathBuf::from)
-        .or_else(dirs::data_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("binance-archive")
 }
 
 async fn download_to(

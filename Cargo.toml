@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-    "projects/binance-downloader",
+members = ["projects/archive",
+    "projects/binance-downloader", "projects/kline-retriever",
     "projects/kline-web-provider",
 ]

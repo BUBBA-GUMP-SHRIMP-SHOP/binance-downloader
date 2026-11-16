@@ -12,9 +12,9 @@ name = "binance-downloader"
 path = "src/main.rs"
 
 [dependencies]
+archive = { path = "../archive" }
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive"] }
-dirs = "7.0.0"
 reqwest = "0.13.2"
 tokio = { version = "1.51.1", features = ["rt", "macros", "rt-multi-thread", "parking_lot", "fs", "io-std", "io-util", "sync"] }
 url = "2.5.8"

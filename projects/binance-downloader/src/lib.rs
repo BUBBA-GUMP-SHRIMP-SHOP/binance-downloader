@@ -81,7 +81,7 @@ impl Downloader {
         let destination = Arc::new(
             options
                 .destination
-                .unwrap_or_else(paths::default_archive_root),
+                .unwrap_or_else(archive::default_archive_root),
         );
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(options.jobs)
