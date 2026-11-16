@@ -57,11 +57,11 @@ curl --no-buffer http://127.0.0.1:8000/klines-jsonl \
   -d '{"startDate":"2025-01-01T00:00","endDate":"2025-01-01T00:01","symbol":"BTCUSDT"}'
 ```
 
-The response is `application/x-ndjson`, one JSON object per line, containing only
-CSV columns 0–5 as JSON numbers:
+The response is `application/x-ndjson`, one JSON object per line, containing
+CSV columns 0–5 as JSON numbers plus an `interpolated` marker:
 
 ```json
-{"open_time":1735689600000000,"open":1.25,"high":2.5,"low":1.0,"close":2.0,"volume":100.5}
+{"open_time":1735689600000000,"open":1.25,"high":2.5,"low":1.0,"close":2.0,"volume":100.5,"interpolated":0.0}
 ```
 
 `open_time` preserves the archive's timestamp unit (milliseconds before 2025,
@@ -104,3 +104,7 @@ numbers truncated toward zero to at most five decimal places (without padding
 trailing zeros). Equal nonnegative values, including two zeros, produce zero. Undefined
 zero transitions, negative values, and non-finite calculations produce JSON `null`
 for that field. Normal JSONL output keeps its original decimal precision.
+
+Every JSONL row includes `interpolated`: `0.0` for an original archive row and
+`1.0` for a row inserted by carry-forward. Gain output retains the former row's
+marker, matching its `open_time`; this marker is not part of the gain calculation.

@@ -87,6 +87,7 @@ enum OutputFormat {
 #[serde(crate = "rocket::serde")]
 struct KlineJson {
     open_time: u64,
+    interpolated: f64,
     open: serde_json::Number,
     high: serde_json::Number,
     low: serde_json::Number,
@@ -111,6 +112,7 @@ impl KlineJson {
         };
         Ok(Self {
             open_time,
+            interpolated: 0.0,
             open: number()?,
             high: number()?,
             low: number()?,
@@ -145,6 +147,7 @@ fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
     #[serde(crate = "rocket::serde")]
     struct GainRow {
         open_time: u64,
+        interpolated: f64,
         open: Option<f64>,
         high: Option<f64>,
         low: Option<f64>,
@@ -156,6 +159,7 @@ fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
     };
     let row = GainRow {
         open_time: former.open_time,
+        interpolated: former.interpolated,
         open: calculate(&former.open, &later.open),
         high: calculate(&former.high, &later.high),
         low: calculate(&former.low, &later.low),
@@ -201,6 +205,7 @@ impl KlineReader {
                     .ok_or_else(|| io::Error::other("timestamp overflow"))?;
                 if next_time < record.micros()? {
                     let mut filled = previous.clone();
+                    filled.interpolated = 1.0;
                     filled.open_time = if next_time >= KlineJson::MICROSECOND_START {
                         next_time
                     } else {
@@ -609,7 +614,8 @@ mod tests {
         let names = ["open_time", "open", "high", "low", "close", "volume"];
         for row in &rows {
             let object = row.as_object().unwrap();
-            assert_eq!(object.len(), 6);
+            assert_eq!(object.len(), 7);
+            assert_eq!(object["interpolated"], 0.0);
             assert!(names.iter().all(|name| object[*name].is_number()));
         }
         assert_eq!(rows[0]["open_time"].as_u64(), Some(1735689600000000));
@@ -689,7 +695,10 @@ mod tests {
                         1735689660000000_u64 + index as u64 * 60_000_000
                     );
                 }
+                assert_eq!(rows[0]["interpolated"], 0.0);
+                assert_eq!(rows[3]["interpolated"], 0.0);
                 for row in &rows[1..3] {
+                    assert_eq!(row["interpolated"], 1.0);
                     for name in ["open", "high", "low", "close", "volume"] {
                         assert_eq!(row[name], rows[0][name]);
                     }
@@ -754,8 +763,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                serde_json::json!({"open_time":1735689600000000_u64,"open":25.0,"high":-100.0,"low":25.0,"close":0.0,"volume":null}),
-                serde_json::json!({"open_time":1735689660000000_u64,"open":-25.0,"high":100.0,"low":-25.0,"close":-100.0,"volume":null}),
+                serde_json::json!({"open_time":1735689600000000_u64,"open":25.0,"high":-100.0,"low":25.0,"close":0.0,"volume":null,"interpolated":0.0}),
+                serde_json::json!({"open_time":1735689660000000_u64,"open":-25.0,"high":100.0,"low":-25.0,"close":-100.0,"volume":null,"interpolated":0.0}),
             ]
         );
         let response = client
@@ -792,6 +801,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["open_time"], 1735689600000000_u64);
         assert_eq!(rows[1]["open_time"], 1735689660000000_u64);
+        assert_eq!(rows[0]["interpolated"], 0.0);
+        assert_eq!(rows[1]["interpolated"], 1.0);
         for field in ["open", "high", "low", "close", "volume"] {
             assert_eq!(rows[0][field], 0.0);
             assert_eq!(rows[1][field], 25.0);
