@@ -102,3 +102,26 @@ systemctl --user disable --now binance-downloader.service  # disable service
 The service normally runs within your systemd user session. To keep it available
 after logout, enable lingering for your account with `loginctl enable-linger "$USER"`
 if your system permits it.
+
+## Library usage
+
+The `binance_downloader` library provides a bounded Tokio channel for archive links.
+Call `start_downloads` inside a Tokio runtime, then clone the sender for each producer:
+
+```rust,no_run
+use binance_downloader::{start_downloads, DownloadOptions};
+
+# async fn example() -> anyhow::Result<()> {
+let (sender, downloads) = start_downloads(DownloadOptions::default(), 100)?;
+sender.add_link("https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2026-04.zip").await?;
+drop(sender);
+downloads.await??;
+# Ok(())
+# }
+```
+
+`add_link` validates the URL and waits for queue capacity. It confirms enqueueing;
+await the task to observe download failures. All sender clones must be dropped
+before the task finishes. Previously queued downloads drain on shutdown. Duplicate
+archives are skipped for the lifetime of the worker. `DownloadOptions` controls
+archive destination, concurrent downloads, progress display, and quiet mode.

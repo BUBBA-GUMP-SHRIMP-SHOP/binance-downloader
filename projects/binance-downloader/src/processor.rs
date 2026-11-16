@@ -1,9 +1,44 @@
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use std::future::Future;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt},
     task::JoinSet,
 };
+
+/// Process a bounded channel until all senders close, then finish active work.
+pub async fn run_channel<F, Fut>(
+    mut receiver: tokio::sync::mpsc::Receiver<String>,
+    parallelism: usize,
+    mut worker: F,
+) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    ensure!(parallelism > 0, "parallelism must be positive");
+    let mut tasks = JoinSet::new();
+    let result: Result<()> = async {
+        loop {
+            if tasks.len() >= parallelism {
+                tasks.join_next().await.transpose()?;
+            }
+            let Some(line) = receiver.recv().await else {
+                break;
+            };
+            tasks.spawn(worker(line));
+        }
+        Ok(())
+    }
+    .await;
+    let mut task_result = Ok(());
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            task_result = Err(error.into());
+        }
+    }
+    result?;
+    task_result
+}
 
 /// Read incrementally and apply backpressure without blocking runtime threads.
 /// Item failures are reported by the worker. A line containing `poison pill`
@@ -52,8 +87,8 @@ where
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     // A single-thread runtime exposes the old blocking-channel deadlock.

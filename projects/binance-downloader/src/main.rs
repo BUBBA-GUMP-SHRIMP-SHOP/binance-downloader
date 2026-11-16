@@ -1,10 +1,7 @@
-mod display;
-mod paths;
-mod processor;
-
-use anyhow::{Result, bail};
+use anyhow::Result;
+use binance_downloader::{DownloadOptions, run};
 use clap::Parser;
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
 use tokio::io::{AsyncRead, BufReader};
 
 #[derive(Parser)]
@@ -33,47 +30,14 @@ async fn main() -> Result<()> {
         None | Some("-") => Box::new(tokio::io::stdin()),
         Some(filename) => Box::new(tokio::fs::File::open(filename).await?),
     };
-    let destination = Arc::new(args.destination.unwrap_or_else(paths::default_archive_root));
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(args.jobs as usize)
-        .http2_adaptive_window(true)
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(3600))
-        .build()?;
-    let display = Arc::new(display::Display::new(!args.no_progress, args.quiet));
-    let mut seen = HashSet::new();
-    let result = processor::run(BufReader::new(reader), args.jobs as usize, |line| {
-        let parsed = paths::FileInfo::parse(&line);
-        let duplicate = parsed.as_ref().is_ok_and(|info| !seen.insert(info.clone()));
-        let destination = destination.clone();
-        let client = client.clone();
-        let display = display.clone();
-        async move {
-            if duplicate {
-                display.duplicate();
-                return;
-            }
-            let info = match parsed {
-                Ok(info) => info,
-                Err(error) => {
-                    display.invalid(format!("{line}: {error}"));
-                    return;
-                }
-            };
-            let id = display.start(info.filename.clone());
-            let outcome = info
-                .download(&client, &destination, |bytes, total| {
-                    display.progress(id, bytes, total)
-                })
-                .await;
-            display.finish(id, outcome);
-        }
-    })
-    .await;
-    let failed = display.summary();
-    result?;
-    if failed > 0 {
-        bail!("{failed} download(s) failed");
-    }
-    Ok(())
+    run(
+        BufReader::new(reader),
+        DownloadOptions {
+            destination: args.destination,
+            jobs: args.jobs as usize,
+            no_progress: args.no_progress,
+            quiet: args.quiet,
+        },
+    )
+    .await
 }
