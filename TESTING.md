@@ -1,33 +1,18 @@
 # Testing
 
-This project includes unit tests for the URL/path parsing logic and the processor pipeline wiring helpers.
-
-## Run tests
-
 ```bash
-cargo test
+cargo test --offline
+cargo clippy --offline --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-## Current unit test coverage
+Tests cover strict Binance URL parsing, path construction, bounded concurrency
+on a single-thread runtime, and zero-worker rejection. Local HTTP server tests
+verify successful streaming, skipping completed files, 404 handling, HTTP error
+rejection, partial-file cleanup after a truncated response, and multi-megabyte buffered
+writes including a final partial buffer. They require
+permission to bind a loopback socket and never contact Binance.
 
-### paths
-
-Tests in `src/paths.rs` validate:
-
-- Binance kline URL parsing into `FileInfo` fields (`symbol`, `year`, `month`, `filename`)
-- Rejection of non-matching URLs
-- Construction of expected remote URLs
-- Local archive path suffix structure for generated file paths
-
-### processor
-
-Tests in `src/processor.rs` validate:
-
-- `ProcessorUnit::process` applies the provided transform function
-- `ProcessorUnit::connect` stores an input receiver in the internal set
-- `ProcessConnector::connect_to` invokes downstream processor connection
-
-## Notes
-
-- These are deterministic unit tests and do not make real network requests.
-- No integration tests are currently defined for download/network behavior.
+For a manual terminal check, run with a URL list and `--jobs 3`. Confirm that
+active rows show byte counts and speeds and that completed downloads leave a
+summary. Repeat with `--no-progress` or redirect stderr to verify plain logging.
