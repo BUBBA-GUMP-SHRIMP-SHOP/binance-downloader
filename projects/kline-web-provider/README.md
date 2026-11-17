@@ -8,6 +8,20 @@ Run from the workspace root:
 cargo run -p kline-web-provider
 ```
 
+Downloader settings can be passed after Cargo's `--` separator:
+
+```bash
+cargo run -p kline-web-provider -- --destination /mnt/archive --jobs 8 --no-progress
+```
+
+The provider shares the downloader's options: `--destination` / `-d`,
+`--jobs` / `-j` (default 20, range 1–256), `--no-progress`, and `--quiet` / `-q`.
+They apply to downloads prepared by all endpoints. The destination also controls
+where the provider reads archives. Quiet mode suppresses routine downloader output
+and takes precedence over `--no-progress`; Rocket logging is configured separately.
+The provider accepts no URL filename or stdin input because HTTP requests determine
+the required archives. Use `--help` to list the options.
+
 The server listens at `http://127.0.0.1:8000` by default:
 
 - `GET /` returns the service name.
@@ -43,7 +57,7 @@ window can exceed one month. The output line cap is also multiplied: `window: 10
 returns up to 30 lines from the expanded date range.
 Invalid cluster values or expansion beyond the supported date range return HTTP 422.
 
-The archive root follows the shared `archive` crate: `ARCHIVE_BASE_PATH`, then the
+Without `--destination`, the archive root follows the shared `archive` crate: `ARCHIVE_BASE_PATH`, then the
 OS data directory, then the current directory, with `binance-archive` appended.
 Before streaming, the endpoint queues every month touched by the inclusive range
 through `binance-downloader` and waits for completion. Existing nonempty files are

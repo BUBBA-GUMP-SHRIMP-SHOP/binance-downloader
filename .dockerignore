@@ -1,0 +1,9 @@
+.git
+target
+**/target
+**/.trunk
+.aws
+.codex
+.agents
+.vscode
+.trunk

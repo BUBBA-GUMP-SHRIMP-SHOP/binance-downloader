@@ -6,7 +6,36 @@ use anyhow::{Result, bail, ensure};
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{io::AsyncBufRead, sync::mpsc, task::JoinHandle};
 
+/// Command-line settings shared by the downloader and services embedding it.
+#[derive(Clone, Debug, clap::Args)]
+pub struct DownloadArgs {
+    /// Archive root directory (files go under PATH/data/spot/monthly/klines)
+    #[arg(short = 'd', long, value_name = "PATH")]
+    pub destination: Option<PathBuf>,
+    /// Maximum simultaneous downloads
+    #[arg(short = 'j', long, default_value = "20", value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub jobs: u16,
+    /// Print completion lines instead of an interactive display
+    #[arg(long)]
+    pub no_progress: bool,
+    /// Suppress progress and routine messages; errors remain visible
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+impl From<DownloadArgs> for DownloadOptions {
+    fn from(args: DownloadArgs) -> Self {
+        Self {
+            destination: args.destination,
+            jobs: usize::from(args.jobs),
+            no_progress: args.no_progress,
+            quiet: args.quiet,
+        }
+    }
+}
+
 /// Configuration shared by the CLI and embedded downloader.
+#[derive(Clone)]
 pub struct DownloadOptions {
     pub destination: Option<PathBuf>,
     pub jobs: usize,

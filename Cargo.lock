@@ -1051,6 +1051,7 @@ dependencies = [
  "anyhow",
  "archive",
  "binance-downloader",
+ "clap",
  "kline-retriever",
  "rocket",
  "serde_json",

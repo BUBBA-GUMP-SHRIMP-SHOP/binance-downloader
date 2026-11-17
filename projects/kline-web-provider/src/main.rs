@@ -1,6 +1,8 @@
 mod gain;
 mod rapido;
 
+use binance_downloader::{DownloadArgs, DownloadOptions};
+use clap::Parser;
 use kline_retriever::{PrimitiveDateTime, parse_date, publish_lines};
 use rocket::serde::{Deserialize, Serialize, json::Json};
 use rocket::tokio::{
@@ -17,25 +19,31 @@ use rocket::{
 use std::{
     future::Future,
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
 };
 
-struct ArchiveRoot(PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>);
+#[derive(Parser)]
+#[command(about = "Serve Binance monthly 1-minute spot klines")]
+struct Args {
+    #[command(flatten)]
+    download: DownloadArgs,
+}
+
+struct ArchiveRoot(
+    PathBuf,
+    std::sync::Arc<tokio::sync::Mutex<()>>,
+    DownloadOptions,
+);
 
 async fn ensure_downloaded(
-    root: &Path,
+    options: DownloadOptions,
     symbol: &str,
     start: PrimitiveDateTime,
     end: PrimitiveDateTime,
 ) -> anyhow::Result<()> {
-    use binance_downloader::{DownloadOptions, start_downloads};
-    let options = DownloadOptions {
-        destination: Some(root.to_path_buf()),
-        quiet: true,
-        ..Default::default()
-    };
+    use binance_downloader::start_downloads;
     let (sender, downloads) = start_downloads(options, 100)?;
     let mut month = (start.year(), start.month() as u8);
     let last = (end.year(), end.month() as u8);
@@ -533,13 +541,13 @@ async fn start_stream(
         .transpose()?;
     let start = expand_clusters(start, end, clusters)?;
     // Keep the gate until downloads finish even if this request disconnects.
-    let download_root = root.0.clone();
+    let download_options = root.2.clone();
     let download_symbol = range.symbol.clone();
     let gate = root.1.clone();
     // Finish preparation before creating a publisher or reading any rows.
     let preparation = tokio::spawn(async move {
         let _guard = gate.lock().await;
-        ensure_downloaded(&download_root, &download_symbol, start, end).await
+        ensure_downloaded(download_options, &download_symbol, start, end).await
     })
     .await;
     if require_downloads {
@@ -597,14 +605,29 @@ fn health() -> &'static str {
 
 #[launch]
 fn rocket() -> Rocket<Build> {
-    build_rocket(archive::default_archive_root())
+    build_rocket_with_options(Args::parse().download.into())
 }
 
+#[cfg(test)]
 fn build_rocket(root: PathBuf) -> Rocket<Build> {
+    build_rocket_with_options(DownloadOptions {
+        destination: Some(root),
+        quiet: true,
+        ..Default::default()
+    })
+}
+
+fn build_rocket_with_options(mut options: DownloadOptions) -> Rocket<Build> {
+    let root = options
+        .destination
+        .clone()
+        .unwrap_or_else(archive::default_archive_root);
+    options.destination = Some(root.clone());
     rocket::build()
         .manage(ArchiveRoot(
             root,
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            options,
         ))
         .mount(
             "/",
@@ -619,6 +642,31 @@ mod tests {
         http::{ContentType, Status},
         local::blocking::Client,
     };
+
+    #[test]
+    fn downloader_arguments_reach_server_state() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from([
+            "kline-web-provider",
+            "-d",
+            "/tmp/custom-archive",
+            "-j",
+            "7",
+            "--no-progress",
+            "-q",
+        ])
+        .unwrap();
+        let server = super::build_rocket_with_options(args.download.into());
+        let state = server.state::<super::ArchiveRoot>().unwrap();
+        assert_eq!(state.0, std::path::PathBuf::from("/tmp/custom-archive"));
+        assert_eq!(state.2.destination.as_ref(), Some(&state.0));
+        assert_eq!(state.2.jobs, 7);
+        assert!(state.2.no_progress);
+        assert!(state.2.quiet);
+        for jobs in ["0", "257"] {
+            assert!(super::Args::try_parse_from(["provider", "--jobs", jobs]).is_err());
+        }
+    }
 
     fn write_month(root: &std::path::Path, year: i32, month: u8, body: &[u8]) {
         use std::io::Write;
