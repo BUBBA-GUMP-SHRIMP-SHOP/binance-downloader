@@ -8,8 +8,8 @@ services:
     ports:
       - "9001:8000"
     environment:
-      ROCKET_ADDRESS: 0.0.0.0
-      ROCKET_PORT: "8000"
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8000"
     volumes:
       - /home/jbc/.local/share/binance-archive:/app/data
     restart: always
