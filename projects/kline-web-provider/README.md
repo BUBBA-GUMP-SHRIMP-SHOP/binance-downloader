@@ -129,7 +129,12 @@ rows; empty or single-row inputs produce an empty response. Combine with
 `?carry-forward=true&gain=true` to fill gaps before calculating gain. Unchanged
 carried values produce zero gain.
 
-The calculation lives in `src/gain.rs`. Derived gains use finite floating-point
+The server downloads and verifies the [gain-v1.0.0.wasm release asset](https://github.com/BUBBA-GUMP-SHRIMP-SHOP/extism-wasm-plugins/releases/download/v1.0.0/gain-v1.0.0.wasm)
+when a request first needs gain processing. It caches the compiled Extism
+plugin for the process and uses a fresh instance per stream. If loading fails,
+the request returns HTTP 503 and later requests can retry.
+
+Derived gains use finite floating-point
 numbers truncated toward zero to at most five decimal places (without padding
 trailing zeros). Equal nonnegative values, including two zeros, produce zero. Undefined
 zero transitions, negative values, and non-finite calculations produce JSON `null`

@@ -1,69 +1,44 @@
-//! Romeo Disca's symmetric GAIN percentage, based on the later/former ratio.
-//! https://romeo-disca.medium.com/a-more-robust-kpi-for-profits-and-losses-c0aa5ea115c2
+use anyhow::Context;
+use extism::{CompiledPlugin, Manifest, Plugin, PluginBuilder, Wasm};
+use rocket::tokio::{sync::OnceCell, task::spawn_blocking};
+use serde_json::Number;
+use std::{io, time::Duration};
 
-/// Positive ratios map to `100 * (r - 1)` for r >= 1, and
-/// `100 * (1 - 1/r)` for r < 1. Equal nonnegative values return zero.
-/// Results are truncated toward zero to five decimal places.
-/// Undefined or non-finite results return None (serialized as JSON null).
-pub(crate) fn gain(former: f64, later: f64) -> Option<f64> {
-    if !former.is_finite() || !later.is_finite() || former < 0.0 || later < 0.0 {
-        return None;
-    }
-    if former == later {
-        return Some(0.0);
-    }
-    if former == 0.0 || later == 0.0 {
-        return None;
-    }
-    let value = if later >= former {
-        100.0 * (later / former - 1.0)
-    } else {
-        100.0 * (1.0 - former / later)
-    };
-    if !value.is_finite() {
-        return None;
-    }
-    let scaled = value * 10_000.0;
-    // Values this large already have no fractional precision in f64.
-    let truncated = if scaled.is_finite() {
-        scaled.trunc() / 10_000.0
-    } else {
-        value
-    };
-    Some(if truncated == 0.0 { 0.0 } else { truncated })
+const URL: &str = "https://github.com/BUBBA-GUMP-SHRIMP-SHOP/extism-wasm-plugins/releases/download/v1.0.0/gain-v1.0.0.wasm";
+const SHA256: &str = "6262f1237ee59e66f1daf7a0ae2c61e5b9d7fc36a0b46eb6492349278e3eda1c";
+static COMPILED: OnceCell<CompiledPlugin> = OnceCell::const_new();
+
+pub(crate) async fn plugin() -> anyhow::Result<Plugin> {
+    let compiled = COMPILED
+        .get_or_try_init(|| async {
+            let wasm = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?
+                .get(URL)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            let manifest = Manifest::new([Wasm::data(wasm.to_vec()).with_hash(SHA256)]);
+            spawn_blocking(move || PluginBuilder::new(manifest).compile()).await?
+        })
+        .await
+        .context("could not load the gain-v1.0.0 Extism plugin")?;
+    let plugin = Plugin::new_from_compiled(compiled)?;
+    anyhow::ensure!(plugin.function_exists("gain"), "missing gain export");
+    Ok(plugin)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::gain;
-
-    #[test]
-    fn gains_and_losses_are_symmetric() {
-        assert_eq!(gain(100.0, 125.0), Some(25.0));
-        assert_eq!(gain(125.0, 100.0), Some(-25.0));
-        assert_eq!(gain(10.0, 10.0), Some(0.0));
-    }
-
-    #[test]
-    fn truncates_positive_and_negative_gains_without_rounding() {
-        assert_eq!(gain(100.0, 101.23456789), Some(1.23456));
-        assert_eq!(gain(101.23456789, 100.0), Some(-1.23456));
-        assert_eq!(gain(100.0, 100.0000001), Some(0.0));
-        assert_eq!(gain(100.0000001, 100.0), Some(0.0));
-    }
-
-    #[test]
-    fn undefined_values_are_not_emitted_as_nonfinite_json_numbers() {
-        assert_eq!(gain(0.0, 0.0), Some(0.0));
-        for (former, later) in [
-            (0.0, 1.0),
-            (1.0, 0.0),
-            (-1.0, 1.0),
-            (f64::NAN, 1.0),
-            (1.0, f64::INFINITY),
-            (f64::MIN_POSITIVE, f64::MAX),
-        ] {
-            assert_eq!(gain(former, later), None);
-        }
-    }
+pub(crate) fn calculate(
+    plugin: &mut Plugin,
+    former: &Number,
+    later: &Number,
+) -> io::Result<Option<f64>> {
+    let (Some(former), Some(later)) = (former.as_f64(), later.as_f64()) else {
+        return Ok(None);
+    };
+    let input = serde_json::json!({ "former": former, "later": later }).to_string();
+    let output: &[u8] = plugin.call("gain", input).map_err(io::Error::other)?;
+    serde_json::from_slice(output).map_err(io::Error::other)
 }

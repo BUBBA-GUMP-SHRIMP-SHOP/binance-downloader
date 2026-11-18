@@ -151,7 +151,11 @@ impl KlineJson {
 }
 
 /// Calculate the five gains from later/former, keeping the former timestamp.
-fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
+fn gain_row(
+    plugin: &mut extism::Plugin,
+    former: &KlineJson,
+    later: &KlineJson,
+) -> io::Result<Vec<u8>> {
     #[derive(Serialize)]
     #[serde(crate = "rocket::serde")]
     struct GainRow {
@@ -163,17 +167,15 @@ fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
         close: Option<f64>,
         volume: Option<f64>,
     }
-    let calculate = |former: &serde_json::Number, later: &serde_json::Number| {
-        gain::gain(former.as_f64()?, later.as_f64()?)
-    };
+    let mut calculate = |former, later| gain::calculate(plugin, former, later);
     let row = GainRow {
         open_time: former.open_time,
         interpolated: former.interpolated,
-        open: calculate(&former.open, &later.open),
-        high: calculate(&former.high, &later.high),
-        low: calculate(&former.low, &later.low),
-        close: calculate(&former.close, &later.close),
-        volume: calculate(&former.volume, &later.volume),
+        open: calculate(&former.open, &later.open)?,
+        high: calculate(&former.high, &later.high)?,
+        low: calculate(&former.low, &later.low)?,
+        close: calculate(&former.close, &later.close)?,
+        volume: calculate(&former.volume, &later.volume)?,
     };
     let mut bytes = serde_json::to_vec(&row).map_err(io::Error::other)?;
     bytes.push(b'\n');
@@ -184,6 +186,7 @@ fn gain_row(former: &KlineJson, later: &KlineJson) -> io::Result<Vec<u8>> {
 struct KlineReader {
     remaining: Option<u64>,
     format: OutputFormat,
+    gain_plugin: Option<extism::Plugin>,
     previous: Option<KlineJson>,
     next: Option<KlineJson>,
     receiver: mpsc::UnboundedReceiver<String>,
@@ -241,9 +244,9 @@ impl KlineReader {
         } else {
             record
         };
-        let bytes = if matches!(self.format, OutputFormat::Jsonl { gain: true, .. }) {
+        let bytes = if let Some(plugin) = &mut self.gain_plugin {
             match &self.previous {
-                Some(former) => gain_row(former, &output)?,
+                Some(former) => gain_row(plugin, former, &output)?,
                 None => Vec::new(),
             }
         } else {
@@ -522,6 +525,7 @@ async fn start_stream(
         return Ok(KlineReader {
             remaining: Some(0),
             format,
+            gain_plugin: None,
             previous: None,
             next: None,
             receiver: mpsc::unbounded_channel().1,
@@ -559,6 +563,14 @@ async fn start_stream(
             )
         })?;
     }
+    let gain_plugin = if matches!(format, OutputFormat::Jsonl { gain: true, .. }) {
+        Some(gain::plugin().await.map_err(|error| {
+            eprintln!("Gain plugin load failed: {error:#}");
+            status::Custom(Status::ServiceUnavailable, "Gain plugin unavailable".into())
+        })?)
+    } else {
+        None
+    };
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let publisher = tokio::spawn(publish_lines(
         root.0.clone(),
@@ -581,6 +593,7 @@ async fn start_stream(
     let mut reader = KlineReader {
         remaining: window,
         format,
+        gain_plugin,
         previous: None,
         next: None,
         receiver,
@@ -1289,7 +1302,7 @@ mod tests {
     #[test]
     fn jsonl_gain_uses_consecutive_rows_and_former_timestamps() {
         let root = tempfile::tempdir().unwrap();
-        write_month(root.path(), 2025, 1, b"1735689600000000,100,200,80,100,0\n1735689660000000,125,100,100,100,5\n1735689720000000,100,200,80,50,0\n");
+        write_month(root.path(), 2025, 1, b"1735689600000000,100,200,80,100,0\n1735689660000000,125,100,100,101.23456789,5\n1735689720000000,100,200,80,101.23456789,0\n");
         let client = Client::tracked(build_rocket(root.path().into())).unwrap();
         let body =
             r#"{"endDate":"2025-01-01T00:00","startDate":"2025-01-01T00:02","symbol":"BTCUSDT"}"#;
@@ -1307,8 +1320,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                serde_json::json!({"open_time":1735689600000000_u64,"open":25.0,"high":-100.0,"low":25.0,"close":0.0,"volume":null,"interpolated":0.0}),
-                serde_json::json!({"open_time":1735689660000000_u64,"open":-25.0,"high":100.0,"low":-25.0,"close":-100.0,"volume":null,"interpolated":0.0}),
+                serde_json::json!({"open_time":1735689600000000_u64,"open":25.0,"high":-100.0,"low":25.0,"close":1.23456,"volume":null,"interpolated":0.0}),
+                serde_json::json!({"open_time":1735689660000000_u64,"open":-25.0,"high":100.0,"low":-25.0,"close":0.0,"volume":null,"interpolated":0.0}),
             ]
         );
         let response = client
@@ -1376,6 +1389,7 @@ mod tests {
         let mut reader = super::KlineReader {
             remaining: None,
             format: super::OutputFormat::Csv,
+            gain_plugin: None,
             previous: None,
             next: None,
             receiver,
